@@ -41,6 +41,28 @@ export const SERVICE_TEMPLATES = {
     liveness: '/', readiness: '/',
     color: '#529cff',
   },
+  // ── Next.js (SSR/ISR 프론트엔드) ─────────────────────
+  // 자체 Node.js 서버(포트 3000)를 사용하며, nginx 정적 파일 서빙과 다름
+  // API Routes를 통해 DB 직접 연결 가능 (CONNECTION_RULES 참조)
+  // standalone 모드로 빌드하여 경량 Docker 이미지 생성
+  'nextjs': {
+    label: 'Next.js', icon: '▲',
+    cpuReq: '100m', memReq: '256Mi', cpuLim: null, memLim: '512Mi',
+    port: 3000, startupFT: 15, startupPS: 5,
+    liveness: '/api/health', readiness: '/api/health',
+    color: '#e2e8f0',
+  },
+  // ── 리버스 프록시 전용 Nginx ──────────────────────────
+  // 프론트엔드가 없거나 별도 백엔드 앞단에 배치하는 nginx
+  // nginx.conf ConfigMap을 통해 upstream 프록시 설정을 주입
+  'nginx': {
+    label: 'Nginx (Reverse Proxy)', icon: '⬡',
+    cpuReq: '50m', memReq: '64Mi', cpuLim: '200m', memLim: '128Mi',
+    port: 80, startupFT: 5, startupPS: 3,
+    liveness: '/healthz', readiness: '/healthz',
+    isNginx: true,   // nginx.conf ConfigMap 마운트 필요 플래그
+    color: '#22d3ee',
+  },
   mysql: {
     label: 'MySQL', icon: '◎',
     cpuReq: '250m', memReq: '512Mi', cpuLim: '500m', memLim: '1Gi',
@@ -48,6 +70,13 @@ export const SERVICE_TEMPLATES = {
     isDB: true, color: '#f97316',
     // httpGet 불가 → exec 방식
     probeExec: ['mysqladmin', 'ping', '-h', 'localhost'],
+  },
+  postgresql: {
+    label: 'PostgreSQL', icon: '⬢',
+    cpuReq: '250m', memReq: '512Mi', cpuLim: '500m', memLim: '1Gi',
+    port: 5432, startupFT: 20, startupPS: 10,
+    isDB: true, color: '#6366f1',
+    probeExec: ['pg_isready', '-U', 'postgres'],
   },
   redis: {
     label: 'Redis', icon: '◈',
@@ -63,14 +92,25 @@ export const SERVICE_TEMPLATES = {
     isDB: true, color: '#86efac',
     probeExec: ['mongosh', '--eval', "db.adminCommand('ping')", '--quiet'],
   },
+  elasticsearch: {
+    label: 'Elasticsearch', icon: '◐',
+    cpuReq: '500m', memReq: '1Gi', cpuLim: '1000m', memLim: '2Gi',
+    port: 9200, startupFT: 30, startupPS: 10,
+    isDB: true, color: '#f59e0b',
+    // httpGet으로 /_cluster/health 확인
+    probeExec: [
+      'sh', '-c',
+      'curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s || exit 1',
+    ],
+  },
 }
 
 export const ENGINE_META = {
-  RA: { label: 'Resource Advisor',   color: '#ffb547' },
-  GE: { label: 'Guardrail Engine',   color: '#ff5f6d' },
-  PG: { label: 'Probe Generator',    color: '#b78bff' },
-  NA: { label: 'Network Analyzer',   color: '#1fe8ff' },
-  VE: { label: 'Validation Engine',  color: '#22e9a0' },
+  RA: { label: 'Resource Advisor',   color: '#ffb547' },  // RA-01~04
+  GE: { label: 'Guardrail Engine',   color: '#ff5f6d' },  // GE-01~04
+  PG: { label: 'Probe Generator',    color: '#b78bff' },  // PG-01~04
+  NA: { label: 'Network Analyzer',   color: '#1fe8ff' },  // NA-01~04
+  VE: { label: 'Validation Engine',  color: '#22e9a0' },  // VE-03,05,06
 }
 
 // ── 파싱 유틸 ──────────────────────────────────────────
@@ -99,6 +139,13 @@ export function runRA(services) {
       issues.push(mk('RA', SEVERITY.WARNING, 'RA-03',
         `[${svc.name}] CPU Limit이 Request의 2배 미만 — CFS Throttling 위험`,
         'Limit을 Request의 최소 2배 이상으로 설정하세요.', 'cpuLim'))
+
+    // RA-04: 멀티 레플리카인데 AntiAffinity 미설정 (kind 멀티 노드 환경)
+    const rep = parseInt(svc.replicas) || 1
+    if (!t.isDB && rep > 1 && !svc.antiAffinity)
+      issues.push(mk('RA', SEVERITY.WARNING, 'RA-04',
+        `[${svc.name}] replicas(${rep}) > 1 이지만 AntiAffinity 미설정`,
+        'kind 멀티 노드에서 Pod가 같은 노드에 몰릴 수 있습니다. AntiAffinity를 활성화하세요.', 'antiAffinity'))
   })
   return issues
 }
@@ -182,6 +229,32 @@ export function runNA(services, opts = {}) {
     issues.push(mk('NA', SEVERITY.WARNING, 'NA-01',
       '[Namespace] NetworkPolicy 미설정 — 전체 Pod 간 통신 허용',
       'default-deny 템플릿을 적용하세요.', 'netPolicy'))
+
+  // NA-02: kind/local 환경에서 expose=true인데 ingressPath 미설정
+  if (opts.cloud === 'kind' || opts.cloud === 'local') {
+    services.forEach(svc => {
+      const t = SERVICE_TEMPLATES[svc.type] || {}
+      if (svc.expose && !t.isDB && !svc.ingressPath)
+        issues.push(mk('NA', SEVERITY.WARNING, 'NA-02',
+          `[${svc.name}] kind 환경에서 외부 노출 설정됐지만 Ingress 경로 미설정`,
+          `Ingress Path를 입력하세요 (예: /${svc.name}). 미설정 시 /${svc.name} 으로 자동 생성됩니다.`,
+          'ingressPath'))
+    })
+  }
+
+  // NA-03: nginx 서비스가 없는 경우 경고
+  // nginx(리버스 프록시) 또는 react-nginx 중 하나는 반드시 있어야 함
+  // 외부 트래픽의 단일 진입점 역할을 하며 kind Ingress Controller와 연동됨
+  const hasNginx = services.some(s =>
+    s.type === 'nginx' || s.type === 'react-nginx'
+  )
+  if (!hasNginx && services.length > 0)
+    issues.push(mk('NA', SEVERITY.WARNING, 'NA-03',
+      '[Namespace] Nginx 서비스 없음 — 외부 트래픽 진입점 미확보',
+      'nginx(리버스 프록시) 또는 react-nginx 서비스를 추가하세요. ' +
+      'kind Ingress Controller는 nginx를 통해 백엔드로 트래픽을 전달합니다.',
+      null))
+
   detectCycles(services).forEach(c =>
     issues.push(mk('NA', SEVERITY.ERROR, 'NA-04',
       `순환 의존성: ${c.join(' → ')}`,
@@ -204,10 +277,19 @@ export function runVE(services, opts = {}) {
       issues.push(mk('VE', SEVERITY.ERROR, 'VE-06',
         `[${svc.name}] Privileged 모드 — 호스트 전체 접근 권한`,
         '반드시 필요한 경우가 아니면 제거하세요.', 'privileged'))
-    if (t.isDB && !svc.storageClass && opts.cloud === 'aws')
-      issues.push(mk('VE', SEVERITY.WARNING, 'VE-03',
-        `[${svc.name}] StorageClass 미지정 → PVC Pending 위험`,
-        'AWS: gp2 또는 gp3 지정', 'storageClass'))
+
+    // VE-03: 클라우드 환경별 StorageClass 미지정 경고
+    if (t.isDB && !svc.storageClass) {
+      if (opts.cloud === 'aws')
+        issues.push(mk('VE', SEVERITY.WARNING, 'VE-03',
+          `[${svc.name}] StorageClass 미지정 → PVC Pending 위험 (AWS)`,
+          'AWS EKS: gp3 지정 권장. 미지정 시 기본 StorageClass 사용', 'storageClass'))
+      else if (opts.cloud === 'gcp')
+        issues.push(mk('VE', SEVERITY.WARNING, 'VE-03',
+          `[${svc.name}] StorageClass 미지정 → PVC Pending 위험 (GCP)`,
+          'GCP GKE: standard-rwo 지정 권장', 'storageClass'))
+      // kind / local: standard(hostPath) 자동 사용 → 경고 없음
+    }
   })
   return issues
 }
