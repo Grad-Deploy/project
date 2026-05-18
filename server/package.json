@@ -1,0 +1,18 @@
+{
+  "name": "grad-deploy-registration",
+  "version": "1.0.0",
+  "description": "Argo CD registration microservice for Grad-Deploy",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "ngrok": "^5.0.0-beta.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
