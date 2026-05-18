@@ -1,7 +1,7 @@
 {
   "name": "grad-deploy-registration",
-  "version": "1.0.0",
-  "description": "Argo CD registration microservice for Grad-Deploy",
+  "version": "1.1.0",
+  "description": "Argo CD registration microservice for Grad-Deploy (with CORS proxy and kubectl bootstrap)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -9,8 +9,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.0",
-    "express": "^4.19.0",
-    "ngrok": "^5.0.0-beta.2"
+    "express": "^4.19.0"
   },
   "engines": {
     "node": ">=18"
