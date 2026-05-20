@@ -976,6 +976,69 @@ spec:
           jsonPointers: [/spec/replicas]`
 }
 
+
+// ════════════════════════════════════════════════════════
+//  부모 Application (App-of-Apps 패턴)
+// ════════════════════════════════════════════════════════
+// ArgoCD UI 에서 ${proj} 이름 하나로 사용자의 모든 서비스를 묶음.
+//
+// 동작 흐름:
+//   1) buildAllFiles 가 결과를 k8s/projects/${proj}/argo-parent-app.yaml 로 push
+//   2) server/index.js /api/bootstrap 이 kubectl apply 로 적용
+//   3) 부모 Application 이 path 안의 argo-appset.yaml 만 sync (directory.include)
+//   4) ApplicationSet 이 services/* 폴더를 자동 스캔 → 자식 Application 생성
+//
+// 결과 (ArgoCD UI 목록):
+//   ${proj}                  ← 부모 (사용자별 1개로 표시)
+//   ├── ${proj}-nginx-svc    ← ApplicationSet 이 자동 생성
+//   ├── ${proj}-spring-svc
+//   └── ${proj}-mysql-svc
+//
+// 부모를 클릭하면 리소스 그래프에서 ApplicationSet 과 자식 Application 들이
+// 트리 구조로 보임 (App-of-Apps 패턴).
+//
+// genArgoCDApp() 가 만든 단일 Application 과의 차이:
+//   - 단일 Application: 서비스 추가 시 매니페스트 수정 필요
+//   - 부모 Application: ApplicationSet 가 폴더 감시 → 자동 추가
+export function genParentApp(cfg = {}) {
+  const {
+    proj    = 'my-app',
+    repoUrl = 'https://github.com/ORG/REPO',
+  } = cfg
+
+  const projectName = `${proj}-project`
+
+  return `apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ${proj}
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/managed-by: grad-deploy
+    grad-deploy/owner: "${proj}"
+    grad-deploy/role: parent
+spec:
+  project: ${projectName}
+  source:
+    repoURL: ${repoUrl}
+    targetRevision: HEAD
+    path: k8s/projects/${proj}
+    directory:
+      recurse: false
+      include: 'argo-appset.yaml'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true`
+}
+
 // ── Argo CD Admin ConfigMap 패치 ──────────────────────
 // 플랫폼 담당자(Admin)가 Argo CD 자체를 구성하는 YAML 생성.
 //
@@ -1630,6 +1693,7 @@ export function buildAllFiles(services, cfg = {}) {
   const argoAppYaml       = genArgoCDApp({ proj, repo: normalizedRepo, ns })
   const argoProjectYaml   = genAppProject(proj, ns, normalizedRepo)
   const argoAppSetYaml    = genApplicationSet({ proj, repo: normalizedRepo, ns, revision: 'HEAD' }) // [신규] ApplicationSet
+  const argoParentAppYaml = genParentApp({ proj, repoUrl: pureRepoUrl })  // [신규] App-of-Apps 부모 Application
   const bootstrapYaml     = genAutopilotBootstrap(proj, normalizedRepo, ns) // [신규] Autopilot Bootstrap
   const resourceQuotaYaml = genResourceQuota(services, ns)
   // [역할2] genArgoCDAdminConfig: { cm, rbac, setup } 분리 반환
@@ -1646,8 +1710,9 @@ export function buildAllFiles(services, cfg = {}) {
 
   // ── [변경] 배포 순서: AppProject → ApplicationSet → ResourceQuota ──
   // (기존 argo-app.yaml 단독 방식 → ApplicationSet 방식으로 전환)
-  files[[projRoot, 'argo-project.yaml'].join('/')]        = argoProjectYaml        // 1단계
-  files[[projRoot, 'argo-appset.yaml'].join('/')]          = argoAppSetYaml         // 2단계 [신규]
+  files[[projRoot, 'argo-project.yaml'].join('/')]        = argoProjectYaml        // 1단계: AppProject
+  files[[projRoot, 'argo-parent-app.yaml'].join('/')]      = argoParentAppYaml      // 2단계: 부모 Application [신규]
+  files[[projRoot, 'argo-appset.yaml'].join('/')]          = argoAppSetYaml         // 3단계: ApplicationSet
   files[[projRoot, 'argo-app.yaml'].join('/')]             = argoAppYaml            // (레거시 참조용)
   files[[projRoot, 'base', 'resource-quota.yaml'].join('/')]  = resourceQuotaYaml     // [변경] projRoot 하위로 이동
   files[[projRoot, 'docs', 'bootstrap.yaml'].join('/')]        = bootstrapYaml;         // [신규] Autopilot 루트

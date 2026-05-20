@@ -420,12 +420,6 @@ app.post('/api/bootstrap', async (req, res) => {
         | kubectl apply -n "\${NS}" -f -`,
     },
     {
-      name: '부모 Application 적용',
-      cmd: `curl -fsSL -H "Authorization: token \${PAT}" \
-        "\${RAW_URL}/main/k8s/projects/\${PROJ}/argo-parent-app.yaml" \
-        | kubectl apply -n "\${NS}" -f -`,
-    },
-    {
       name: 'ApplicationSet 적용',
       cmd: `curl -fsSL -H "Authorization: token \${PAT}" \
         "\${RAW_URL}/main/k8s/projects/\${PROJ}/argo-appset.yaml" \

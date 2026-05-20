@@ -471,6 +471,8 @@ export default function DeployPanel({ state, engineResult, set }) {
       // Repository 등록 + Application 생성 + Sync 트리거를 한 번에 수행
       let argoSetupResult = null
       let argoSetupError = null
+      let bootstrapResult = null
+      let bootstrapError = null
 
       const finalArgoServer = state.argocdServer || import.meta.env.VITE_DEFAULT_ARGOCD_SERVER
       const finalArgoUser = state.argocdUser || import.meta.env.VITE_DEFAULT_ARGOCD_USER || 'admin'
@@ -480,6 +482,32 @@ export default function DeployPanel({ state, engineResult, set }) {
       const canAutoArgo = finalArgoServer && (finalArgoPass || finalArgoToken)
 
       if (canAutoArgo) {
+        // ── 1단계: 클러스터 부트스트랩 (AppProject + ApplicationSet kubectl 적용) ──
+        // argoAutoSetup 이 Application 을 만들기 전에 AppProject 가 클러스터에
+        // 존재해야 하므로, 백엔드 /api/bootstrap 으로 먼저 kubectl 적용 수행.
+        // 백엔드: server/index.js 의 POST /api/bootstrap (Vite proxy 경유).
+        try {
+          const r = await fetch('/api/bootstrap', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              proj: state.proj,
+              repoUrl,
+              ghUser: ghUser.login,
+              pat,
+              namespace: 'argocd',
+            }),
+          })
+          bootstrapResult = await r.json()
+          if (!bootstrapResult.ok) {
+            bootstrapError = `Bootstrap 실패: ${bootstrapResult.steps?.find(s => !s.ok)?.error || 'unknown'}`
+          }
+        } catch (e) {
+          bootstrapError = `Bootstrap 통신 실패: ${e.message}`
+          bootstrapResult = { ok: false, error: e.message }
+        }
+
+        // ── 2단계: ArgoCD 자동 연동 (Repository 등록 + Application 생성 + Sync) ──
         try {
           argoSetupResult = await argoAutoSetup({
             argoServerUrl: finalArgoServer,
@@ -508,7 +536,7 @@ export default function DeployPanel({ state, engineResult, set }) {
         } catch (e) {
           argoSetupError = e.message
         }
-      }
+      }      
 
       // 복사할 원라인 명령어셋 구성 (pure URL 및 올바른 pat 변수 사용)
       const dynamicBootstrapCmd = `kubectl create secret generic ${state.proj}-git-repo-creds -n argocd --from-literal=url="${repoUrl}" --from-literal=username="${ghUser.login}" --from-literal=password="${pat}" --dry-run=client -o yaml | kubectl apply -f - && kubectl label secret ${state.proj}-git-repo-creds -n argocd argocd.argoproj.io/secret-type=repository --overwrite && curl -s -H "Authorization: token ${pat}" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-project.yaml" | kubectl apply -n argocd -f - && curl -s -H "Authorization: token ${pat}" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-appset.yaml" | kubectl apply -n argocd -f -`;
@@ -521,7 +549,9 @@ export default function DeployPanel({ state, engineResult, set }) {
         argoSetup: argoSetupResult,
         argoSetupError,
         argoServerUrl: state.argocdServer,
-        bootstrapCmd: dynamicBootstrapCmd, 
+        bootstrapCmd: dynamicBootstrapCmd,
+        bootstrap: bootstrapResult,
+        bootstrapError,
       })
 
       // 5. 새 레포면 목록 갱신 + 모드 전환
