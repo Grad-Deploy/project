@@ -1631,6 +1631,704 @@ export function buildManifestYAML(services, ns, cloud = 'kind') {
   return chunks.join('\n---\n')
 }
 
+// ════════════════════════════════════════════════════════
+//  [Task 1] Argo CD 운영 환경 검증 산출물 생성
+//
+//  §2.1 클러스터 환경 확인 스크립트
+//  §2.2 admin 운영 절차 스크립트
+//  §2.3 ApplicationSet 검증 스크립트
+//  §2.4 장애 상태별 확인 루틴 문서
+//  §3   admin 운영 절차 + 체크리스트 통합 문서
+// ════════════════════════════════════════════════════════
+
+// ── §2.1 클러스터 환경 확인 스크립트 ──────────────────
+// scripts/check-admin-cluster.sh
+// Argo CD namespace, 핵심 Pod, metrics-server, Ingress Controller,
+// GHCR imagePullSecret 적용 여부를 한 번에 확인
+export function genCheckAdminCluster(proj, ns) {
+  return `#!/usr/bin/env bash
+# ════════════════════════════════════════════════════════
+#  Grad-Deploy — Argo CD 운영 클러스터 환경 확인
+#  Task 1 §2.1  |  실행: bash scripts/check-admin-cluster.sh
+# ════════════════════════════════════════════════════════
+set -euo pipefail
+
+PROJ="${proj}"
+NS="${ns}"
+ARGOCD_NS="argocd"
+PASS=0
+FAIL=0
+WARN=0
+
+print_header() { echo ""; echo "══════════════════════════════════════"; echo "  $1"; echo "══════════════════════════════════════"; }
+check_pass()   { echo "  ✅ $1"; PASS=$((PASS+1)); }
+check_fail()   { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
+check_warn()   { echo "  ⚠️  $1"; WARN=$((WARN+1)); }
+
+print_header "1. Kubernetes 클러스터 접근 확인"
+if kubectl cluster-info &>/dev/null; then
+  check_pass "클러스터 접근 가능"
+  kubectl cluster-info | head -2 | sed 's/^/  │ /'
+else
+  check_fail "클러스터에 접근할 수 없습니다. kubeconfig를 확인하세요."
+  echo "  결과: PASS=\${PASS} FAIL=\${FAIL} WARN=\${WARN}"
+  exit 1
+fi
+
+print_header "2. Argo CD namespace 확인"
+if kubectl get ns \${ARGOCD_NS} &>/dev/null; then
+  check_pass "namespace '\${ARGOCD_NS}' 존재"
+else
+  check_fail "namespace '\${ARGOCD_NS}'가 없습니다. Argo CD를 설치하세요."
+fi
+
+print_header "3. Argo CD 핵심 Pod 상태"
+for COMPONENT in argocd-server argocd-repo-server argocd-application-controller; do
+  POD_STATUS=\$(kubectl get pods -n \${ARGOCD_NS} -l app.kubernetes.io/name=\${COMPONENT} \\
+    -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
+  if [ "\${POD_STATUS}" = "Running" ]; then
+    check_pass "\${COMPONENT}: Running"
+  elif [ "\${POD_STATUS}" = "NotFound" ]; then
+    check_fail "\${COMPONENT}: Pod 없음"
+  else
+    check_warn "\${COMPONENT}: \${POD_STATUS}"
+  fi
+done
+
+print_header "4. Argo CD CRD 설치 확인"
+for CRD in applications.argoproj.io applicationsets.argoproj.io appprojects.argoproj.io; do
+  if kubectl get crd \${CRD} &>/dev/null; then
+    check_pass "CRD \${CRD} 설치됨"
+  else
+    check_fail "CRD \${CRD} 누락"
+  fi
+done
+
+print_header "5. metrics-server 설치 여부"
+if kubectl get deployment metrics-server -n kube-system &>/dev/null; then
+  check_pass "metrics-server 설치됨 (HPA 사용 가능)"
+else
+  check_warn "metrics-server 미설치 — HPA 자동 스케일링이 동작하지 않습니다"
+  echo "  │ 설치: kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml"
+fi
+
+print_header "6. Ingress Controller 설치 여부"
+INGRESS_PODS=\$(kubectl get pods -A -l app.kubernetes.io/name=ingress-nginx \\
+  --field-selector=status.phase=Running -o name 2>/dev/null | wc -l | tr -d ' ')
+if [ "\${INGRESS_PODS}" -gt 0 ]; then
+  check_pass "Nginx Ingress Controller 실행 중 (\${INGRESS_PODS} pods)"
+else
+  check_warn "Nginx Ingress Controller 미설치 — 외부 접근이 제한될 수 있습니다"
+  echo "  │ kind 설치: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml"
+fi
+
+print_header "7. GHCR imagePullSecret 확인"
+SECRET_NAME="ghcr-pull-secret"
+if kubectl get secret \${SECRET_NAME} -n \${NS} &>/dev/null; then
+  check_pass "imagePullSecret '\${SECRET_NAME}' 존재 (ns: \${NS})"
+else
+  HAS_DOCKERCFG=\$(kubectl get secret -n \${NS} -o jsonpath='{range .items[*]}{.type}{"\\n"}{end}' 2>/dev/null | grep -c 'kubernetes.io/dockerconfigjson' || true)
+  if [ "\${HAS_DOCKERCFG}" -gt 0 ]; then
+    check_pass "dockerconfigjson 타입 Secret 존재 (\${HAS_DOCKERCFG}개)"
+  else
+    check_warn "GHCR imagePullSecret 없음 — private 이미지 Pull 시 ImagePullBackOff 발생 가능"
+    echo "  │ 생성 예시:"
+    echo "  │ kubectl create secret docker-registry \${SECRET_NAME} -n \${NS} \\\\"
+    echo "  │   --docker-server=ghcr.io \\\\"
+    echo "  │   --docker-username=<GITHUB_USER> \\\\"
+    echo "  │   --docker-password=<GITHUB_PAT>"
+  fi
+fi
+
+print_header "8. 프로젝트 namespace 확인"
+if kubectl get ns \${NS} &>/dev/null; then
+  check_pass "namespace '\${NS}' 존재"
+else
+  check_warn "namespace '\${NS}'가 아직 없습니다 (Argo CD syncOption CreateNamespace=true로 자동 생성 예정)"
+fi
+
+# ── 결과 요약 ────────────────────────────────────────
+print_header "결과 요약"
+echo "  ✅ PASS: \${PASS}"
+echo "  ❌ FAIL: \${FAIL}"
+echo "  ⚠️  WARN: \${WARN}"
+echo ""
+if [ \${FAIL} -gt 0 ]; then
+  echo "  🚫 FAIL이 있습니다. 위 항목을 해결한 뒤 다시 실행하세요."
+  exit 1
+else
+  echo "  ✅ 클러스터 환경이 정상입니다."
+fi
+`
+}
+
+// ── §2.2 Argo CD admin 상태 확인 스크립트 ────────────
+// scripts/check-argocd-status.sh
+// admin 초기 비밀번호, 접속 URL, 전체 리소스 상태를 한 번에 조회
+export function genCheckArgoCDStatus(proj, ns) {
+  return `#!/usr/bin/env bash
+# ════════════════════════════════════════════════════════
+#  Grad-Deploy — Argo CD Admin 상태 확인
+#  Task 1 §2.2  |  실행: bash scripts/check-argocd-status.sh
+# ════════════════════════════════════════════════════════
+set -euo pipefail
+
+PROJ="${proj}"
+NS="${ns}"
+ARGOCD_NS="argocd"
+
+print_header() { echo ""; echo "══════════════════════════════════════"; echo "  $1"; echo "══════════════════════════════════════"; }
+
+print_header "1. Argo CD admin 초기 비밀번호"
+echo "  다음 명령으로 초기 비밀번호를 확인하세요:"
+echo ""
+echo "  kubectl -n \${ARGOCD_NS} get secret argocd-initial-admin-secret \\\\"
+echo "    -o jsonpath='{.data.password}' | base64 -d; echo"
+echo ""
+ADMIN_PW=\$(kubectl -n \${ARGOCD_NS} get secret argocd-initial-admin-secret \\
+  -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+if [ -n "\${ADMIN_PW}" ]; then
+  echo "  📋 현재 초기 비밀번호: \${ADMIN_PW}"
+else
+  echo "  ⚠️  초기 비밀번호 Secret이 없습니다 (이미 변경되었거나 삭제됨)"
+fi
+
+print_header "2. Argo CD 접속 URL"
+echo "  방법 A — port-forward (로컬 접속):"
+echo "    kubectl port-forward svc/argocd-server -n \${ARGOCD_NS} 8080:443"
+echo "    → https://localhost:8080"
+echo ""
+echo "  방법 B — Ingress 확인:"
+kubectl get ingress -n \${ARGOCD_NS} 2>/dev/null || echo "    (Ingress 없음)"
+echo ""
+echo "  방법 C — NodePort 확인:"
+kubectl get svc argocd-server -n \${ARGOCD_NS} -o jsonpath='{.spec.type}' 2>/dev/null || true
+echo ""
+
+print_header "3. Applications 목록"
+kubectl get applications -n \${ARGOCD_NS} -o wide 2>/dev/null || echo "  (Application 없음)"
+
+print_header "4. ApplicationSets 목록"
+kubectl get applicationsets -n \${ARGOCD_NS} -o wide 2>/dev/null || echo "  (ApplicationSet 없음)"
+
+print_header "5. AppProjects 목록"
+kubectl get appprojects -n \${ARGOCD_NS} -o wide 2>/dev/null || echo "  (AppProject 없음)"
+
+print_header "6. Repositories 연결 상태"
+kubectl get secrets -n \${ARGOCD_NS} -l argocd.argoproj.io/secret-type=repository \\
+  -o custom-columns='NAME:.metadata.name,URL:.data.url' 2>/dev/null || echo "  (Repository Secret 없음)"
+
+print_header "7. Argo CD Pod 리소스 사용량"
+kubectl top pods -n \${ARGOCD_NS} 2>/dev/null || echo "  (metrics-server 미설치)"
+
+print_header "8. Application Sync/Health 요약"
+echo ""
+echo "  │ 상태별 집계:"
+for STATUS in Synced OutOfSync Unknown; do
+  COUNT=\$(kubectl get applications -n \${ARGOCD_NS} -o jsonpath="{.items[?(@.status.sync.status=='\${STATUS}')].metadata.name}" 2>/dev/null | wc -w | tr -d ' ')
+  echo "  │   \${STATUS}: \${COUNT}"
+done
+echo ""
+for HEALTH in Healthy Degraded Progressing Missing Unknown; do
+  COUNT=\$(kubectl get applications -n \${ARGOCD_NS} -o jsonpath="{.items[?(@.status.health.status=='\${HEALTH}')].metadata.name}" 2>/dev/null | wc -w | tr -d ' ')
+  echo "  │   \${HEALTH}: \${COUNT}"
+done
+
+echo ""
+echo "✅ Argo CD 상태 확인 완료"
+`
+}
+
+// ── §2.3 ApplicationSet 검증 스크립트 ────────────────
+// scripts/check-applicationset.sh
+// AppProject 존재, ApplicationSet 감시 경로, 자동 생성 확인
+export function genCheckApplicationSet(proj, ns) {
+  const projectName = `${proj}-project`
+  const appSetName  = `${proj}-appset`
+  const svcPath     = `k8s/projects/${proj}/services`
+
+  return `#!/usr/bin/env bash
+# ════════════════════════════════════════════════════════
+#  Grad-Deploy — ApplicationSet 검증
+#  Task 1 §2.3  |  실행: bash scripts/check-applicationset.sh
+# ════════════════════════════════════════════════════════
+set -euo pipefail
+
+PROJ="${proj}"
+NS="${ns}"
+ARGOCD_NS="argocd"
+PROJECT_NAME="${projectName}"
+APPSET_NAME="${appSetName}"
+SVC_PATH="${svcPath}"
+PASS=0
+FAIL=0
+
+print_header() { echo ""; echo "══════════════════════════════════════"; echo "  $1"; echo "══════════════════════════════════════"; }
+check_pass()   { echo "  ✅ $1"; PASS=$((PASS+1)); }
+check_fail()   { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
+
+print_header "1. AppProject 존재 확인"
+if kubectl get appproject \${PROJECT_NAME} -n \${ARGOCD_NS} &>/dev/null; then
+  check_pass "AppProject '\${PROJECT_NAME}' 존재"
+  echo "  │ sourceRepos:"
+  kubectl get appproject \${PROJECT_NAME} -n \${ARGOCD_NS} \\
+    -o jsonpath='{range .spec.sourceRepos[*]}  │   {@}{"\\n"}{end}' 2>/dev/null
+  echo "  │ destinations:"
+  kubectl get appproject \${PROJECT_NAME} -n \${ARGOCD_NS} \\
+    -o jsonpath='{range .spec.destinations[*]}  │   ns={.namespace} server={.server}{"\\n"}{end}' 2>/dev/null
+else
+  check_fail "AppProject '\${PROJECT_NAME}'가 없습니다"
+  echo "  │ 생성: kubectl apply -f k8s/projects/\${PROJ}/argo-project.yaml -n \${ARGOCD_NS}"
+fi
+
+print_header "2. ApplicationSet 존재 확인"
+if kubectl get applicationset \${APPSET_NAME} -n \${ARGOCD_NS} &>/dev/null; then
+  check_pass "ApplicationSet '\${APPSET_NAME}' 존재"
+else
+  check_fail "ApplicationSet '\${APPSET_NAME}'가 없습니다"
+  echo "  │ 생성: kubectl apply -f k8s/projects/\${PROJ}/argo-appset.yaml -n \${ARGOCD_NS}"
+fi
+
+print_header "3. ApplicationSet 감시 경로 확인"
+WATCH_PATH=\$(kubectl get applicationset \${APPSET_NAME} -n \${ARGOCD_NS} \\
+  -o jsonpath='{.spec.generators[0].git.directories[0].path}' 2>/dev/null || echo "")
+if [ -n "\${WATCH_PATH}" ]; then
+  echo "  │ 감시 경로: \${WATCH_PATH}"
+  if echo "\${WATCH_PATH}" | grep -q "\${SVC_PATH}"; then
+    check_pass "감시 경로가 '\${SVC_PATH}/*' 와 일치"
+  else
+    check_fail "감시 경로 불일치: 예상='\${SVC_PATH}/*', 실제='\${WATCH_PATH}'"
+  fi
+else
+  check_fail "ApplicationSet의 감시 경로를 조회할 수 없습니다"
+fi
+
+print_header "4. 자동 생성된 Application 목록"
+APPS=\$(kubectl get applications -n \${ARGOCD_NS} -l grad-deploy/project=\${PROJ} \\
+  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' 2>/dev/null)
+if [ -n "\${APPS}" ]; then
+  echo "\${APPS}" | sed 's/^/  │ /'
+  APP_COUNT=\$(kubectl get applications -n \${ARGOCD_NS} -l grad-deploy/project=\${PROJ} -o name 2>/dev/null | wc -l | tr -d ' ')
+  check_pass "\${APP_COUNT}개 Application 자동 생성됨"
+else
+  check_fail "프로젝트 '\${PROJ}'에 대한 Application이 없습니다"
+  echo "  │ services/ 폴더에 서비스가 push 되었는지 확인하세요"
+fi
+
+print_header "5. Prune 동작 확인"
+echo "  │ ApplicationSet syncPolicy 확인:"
+kubectl get applicationset \${APPSET_NAME} -n \${ARGOCD_NS} \\
+  -o jsonpath='  │   applicationsSync: {.spec.syncPolicy.applicationsSync}{"\\n"}  │   preserveResourcesOnDeletion: {.spec.syncPolicy.preserveResourcesOnDeletion}{"\\n"}' 2>/dev/null || echo "  │   (조회 실패)"
+check_pass "Prune 설정 확인 완료 (위 값 참조)"
+
+# ── 결과 요약 ────────────────────────────────────────
+print_header "결과 요약"
+echo "  ✅ PASS: \${PASS}"
+echo "  ❌ FAIL: \${FAIL}"
+if [ \${FAIL} -gt 0 ]; then
+  echo ""
+  echo "  🚫 FAIL이 있습니다. 위 항목을 해결한 뒤 다시 실행하세요."
+  exit 1
+else
+  echo ""
+  echo "  ✅ ApplicationSet 검증 완료!"
+fi
+`
+}
+
+// ── §2.4 장애 상태별 확인 루틴 문서 ──────────────────
+// k8s/projects/<proj>/docs/troubleshooting-guide.md
+export function genTroubleshootingGuide(proj, ns) {
+  return `# Grad-Deploy 장애 상태별 확인 루틴
+
+> Task 1 §2.4 — 각 상태별로 Argo CD UI에서 어디를 봐야 하는지와 kubectl 확인 명령을 정리합니다.
+
+---
+
+## 1. ImagePullBackOff
+
+**증상**: Pod가 시작되지 않고 \`ImagePullBackOff\` 또는 \`ErrImagePull\` 상태
+
+**Argo CD UI 확인 위치**:
+- Applications → 해당 앱 클릭 → Pod 리소스 → Events 탭
+- \`Failed to pull image\` 메시지 확인
+
+**kubectl 확인 명령**:
+\`\`\`bash
+# Pod 이벤트 확인
+kubectl describe pod <pod-name> -n ${ns} | grep -A5 Events
+
+# 이미지 이름 확인
+kubectl get pod <pod-name> -n ${ns} -o jsonpath='{.spec.containers[*].image}'
+
+# imagePullSecret 확인
+kubectl get pod <pod-name> -n ${ns} -o jsonpath='{.spec.imagePullSecrets}'
+
+# GHCR 접근 테스트
+docker pull <image-name>
+\`\`\`
+
+**주요 원인**:
+- GHCR package가 private인데 imagePullSecret 미설정
+- 이미지 태그 오타 (\`:latest\` vs \`:<commit-sha>\`)
+- GitHub Actions 빌드 실패로 이미지가 push되지 않음
+
+---
+
+## 2. Pending
+
+**증상**: Pod가 \`Pending\` 상태에서 스케줄링되지 않음
+
+**Argo CD UI 확인 위치**:
+- Applications → 해당 앱 → Pod 리소스 → Status: Pending
+- Events 탭에서 \`FailedScheduling\` 메시지 확인
+
+**kubectl 확인 명령**:
+\`\`\`bash
+# 스케줄링 실패 원인 확인
+kubectl describe pod <pod-name> -n ${ns} | grep -A10 Events
+
+# 노드 리소스 확인
+kubectl top nodes
+
+# ResourceQuota 사용량 확인
+kubectl describe resourcequota -n ${ns}
+
+# PVC 바인딩 상태 확인 (DB 서비스)
+kubectl get pvc -n ${ns}
+\`\`\`
+
+**주요 원인**:
+- 노드 리소스(CPU/메모리) 부족
+- ResourceQuota 초과
+- PersistentVolume 미할당 (DB 서비스)
+- nodeSelector/affinity 조건 불일치
+
+---
+
+## 3. CrashLoopBackOff
+
+**증상**: Pod가 반복적으로 시작/종료되며 \`CrashLoopBackOff\` 상태
+
+**Argo CD UI 확인 위치**:
+- Applications → 해당 앱 → Pod → Logs 탭
+- Restart 횟수 확인 (RESTARTS 컬럼)
+
+**kubectl 확인 명령**:
+\`\`\`bash
+# 컨테이너 로그 확인 (현재)
+kubectl logs <pod-name> -n ${ns}
+
+# 이전 실행 로그 확인 (크래시 직전)
+kubectl logs <pod-name> -n ${ns} --previous
+
+# 종료 코드 확인
+kubectl get pod <pod-name> -n ${ns} -o jsonpath='{.status.containerStatuses[0].lastState.terminated}'
+
+# 환경변수 확인
+kubectl exec <pod-name> -n ${ns} -- env 2>/dev/null || true
+\`\`\`
+
+**주요 원인**:
+- DB 연결 실패 (환경변수 오류 — DB_HOST, DB_PASSWORD 등)
+- 포트 충돌 또는 바인딩 실패
+- 애플리케이션 코드 오류
+- Liveness Probe 실패로 반복 재시작
+
+---
+
+## 4. OOMKilled
+
+**증상**: Pod가 \`OOMKilled\` 사유로 종료됨
+
+**Argo CD UI 확인 위치**:
+- Applications → 해당 앱 → Pod → Events 탭
+- \`OOMKilled\` 메시지와 종료 코드 137 확인
+
+**kubectl 확인 명령**:
+\`\`\`bash
+# OOMKilled 확인
+kubectl get pod <pod-name> -n ${ns} -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'
+
+# 메모리 Limit 확인
+kubectl get pod <pod-name> -n ${ns} -o jsonpath='{.spec.containers[0].resources.limits.memory}'
+
+# 실시간 메모리 사용량
+kubectl top pod <pod-name> -n ${ns}
+\`\`\`
+
+**주요 원인**:
+- memory Limit이 너무 낮음 (특히 Elasticsearch, Java 앱)
+- 메모리 누수
+- ES_JAVA_OPTS 힙 크기가 memLim보다 큼
+
+**해결 방법**:
+- ServiceCard에서 memLim 값을 증가 (예: 512Mi → 1Gi)
+- Elasticsearch: ES_JAVA_OPTS를 memReq의 50% 이하로 설정
+
+---
+
+## 5. OutOfSync
+
+**증상**: Argo CD Application이 \`OutOfSync\` 상태
+
+**Argo CD UI 확인 위치**:
+- Applications → 해당 앱 → Sync Status: OutOfSync
+- Diff 탭에서 Git과 클러스터 간 차이 확인
+- Last Sync Result에서 실패 원인 확인
+
+**kubectl 확인 명령**:
+\`\`\`bash
+# Application 상태 확인
+kubectl get application ${proj}-<service> -n argocd -o jsonpath='{.status.sync}'
+
+# 수동 Sync 실행
+kubectl patch application ${proj}-<service> -n argocd --type merge \\
+  -p '{"operation":{"sync":{"prune":true}}}'
+
+# argocd CLI 사용
+argocd app sync ${proj}-<service>
+argocd app diff ${proj}-<service>
+\`\`\`
+
+**주요 원인**:
+- Git 커밋 후 Argo CD가 아직 감지하지 못함 (polling 간격)
+- Repository Secret 인증 실패
+- ignoreDifferences 미설정으로 HPA replicas 등이 drift로 인식됨
+
+---
+
+## 6. Degraded
+
+**증상**: Argo CD Application Health가 \`Degraded\` 상태
+
+**Argo CD UI 확인 위치**:
+- Applications → 해당 앱 → Health Status: Degraded
+- 리소스 트리에서 빨간색 표시된 항목 클릭
+- Readiness/Liveness Probe 실패 이벤트 확인
+
+**kubectl 확인 명령**:
+\`\`\`bash
+# Deployment 상태 확인
+kubectl rollout status deployment/<service-name> -n ${ns}
+
+# ReplicaSet 확인
+kubectl get rs -n ${ns} -l app=<service-name>
+
+# Endpoint 확인 (Service에 Pod가 연결되었는지)
+kubectl get endpoints <service-name> -n ${ns}
+
+# Probe 실패 이벤트
+kubectl get events -n ${ns} --field-selector reason=Unhealthy
+\`\`\`
+
+**주요 원인**:
+- Readiness Probe 실패 (앱이 시작되었지만 준비되지 않음)
+- 의존 서비스(DB)가 아직 Ready가 아닌 상태
+- 잘못된 Probe 경로 (예: /healthz vs /health)
+
+---
+
+## 7. Progressing
+
+**증상**: Argo CD Application Health가 \`Progressing\` 상태에서 멈춤
+
+**Argo CD UI 확인 위치**:
+- Applications → 해당 앱 → Health Status: Progressing
+- Deployment 리소스 → rollout이 진행 중인지 확인
+- Pod 상태가 \`Running\`으로 전환되는지 관찰
+
+**kubectl 확인 명령**:
+\`\`\`bash
+# Deployment rollout 상태
+kubectl rollout status deployment/<service-name> -n ${ns} --timeout=120s
+
+# 새 ReplicaSet의 Pod 생성 상태
+kubectl get rs -n ${ns} -l app=<service-name> --sort-by='.metadata.creationTimestamp'
+
+# Startup Probe 진행 중 여부 확인
+kubectl describe pod <pod-name> -n ${ns} | grep -A3 "Startup"
+\`\`\`
+
+**주요 원인**:
+- Startup Probe \`failureThreshold\` × \`periodSeconds\`가 길어서 대기 중
+- 새 이미지 Pull이 느림 (대용량 이미지)
+- Rolling Update 중 — 정상적인 경우 일정 시간 후 Healthy로 전환됨
+
+---
+
+## 빠른 참조 — 장애 진단 순서
+
+\`\`\`
+1. Argo CD UI → Application 상태 확인 (Sync + Health)
+2. kubectl get pods -n ${ns}  → Pod 상태 확인
+3. kubectl describe pod <pod> -n ${ns}  → Events 확인
+4. kubectl logs <pod> -n ${ns}  → 앱 로그 확인
+5. kubectl get events -n ${ns} --sort-by='.lastTimestamp'  → 최근 이벤트
+\`\`\`
+`
+}
+
+// ── §2.2 + §4 Admin 운영 절차 + 체크리스트 통합 문서 ─
+// k8s/projects/<proj>/docs/admin-ops-guide.md
+export function genAdminOpsGuide(proj, ns) {
+  const projectName = `${proj}-project`
+  const appSetName  = `${proj}-appset`
+
+  return `# Grad-Deploy Admin 운영 절차 가이드
+
+> Task 1 §2.2 + §4 — 관리자가 Argo CD admin 대시보드에서 전체 상태를 확인하는 절차와 발표 당일 체크리스트를 정리합니다.
+
+---
+
+## 1. Argo CD Admin 접속 절차
+
+### 1-1. 초기 비밀번호 확인
+
+\`\`\`bash
+kubectl -n argocd get secret argocd-initial-admin-secret \\
+  -o jsonpath='{.data.password}' | base64 -d; echo
+\`\`\`
+
+> ⚠️ 최초 로그인 후 비밀번호를 변경하면 이 Secret은 삭제 가능합니다.
+> 변경: \`argocd account update-password\`
+
+### 1-2. 접속 URL 확보
+
+**방법 A — port-forward (권장, 로컬)**:
+\`\`\`bash
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+# 접속: https://localhost:8080  (ID: admin)
+\`\`\`
+
+**방법 B — cloudflared tunnel (발표/외부 접속)**:
+\`\`\`bash
+cloudflared tunnel --url https://localhost:8080
+# 생성된 https://xxx.trycloudflare.com URL 공유
+\`\`\`
+
+**방법 C — NodePort 변경**:
+\`\`\`bash
+kubectl patch svc argocd-server -n argocd -p '{"spec":{"type":"NodePort"}}'
+kubectl get svc argocd-server -n argocd
+\`\`\`
+
+---
+
+## 2. Admin 로그인 후 확인 메뉴
+
+### 2-1. Applications
+- 전체 Application 목록에서 Sync/Health 상태 확인
+- 정상: 모든 앱이 \`Synced\` + \`Healthy\`
+- \`${proj}-<서비스명>\` 형태로 서비스별 Application이 보여야 함
+
+### 2-2. ApplicationSets
+- Settings → ApplicationSets (또는 \`kubectl get applicationsets -n argocd\`)
+- \`${appSetName}\` 이 존재하고, 감시 경로가 \`k8s/projects/${proj}/services/*\` 인지 확인
+
+### 2-3. Projects
+- Settings → Projects
+- \`${projectName}\` 이 존재하고 sourceRepos, destinations 이 올바른지 확인
+
+### 2-4. Repositories
+- Settings → Repositories
+- Git 저장소 URL이 등록되어 있고 CONNECTION STATUS가 \`Successful\` 인지 확인
+- \`Failed\` 이면: PAT 만료, 저장소 삭제, URL 오타 등 점검
+
+### 2-5. Settings
+- Accounts: admin 외 추가 계정 확인
+- Clusters: \`https://kubernetes.default.svc\` 연결 상태 확인
+
+---
+
+## 3. ApplicationSet 검증 체크리스트
+
+| # | 검증 항목 | 확인 방법 | 정상 기준 |
+|---|----------|----------|----------|
+| 1 | AppProject가 먼저 생성됨 | \`kubectl get appproject ${projectName} -n argocd\` | 리소스 존재 |
+| 2 | ApplicationSet이 services/* 감시 | \`kubectl get appset ${appSetName} -n argocd -o yaml\` → generators.git.directories.path | \`k8s/projects/${proj}/services/*\` |
+| 3 | 서비스 폴더 추가 시 App 자동 생성 | Git push 후 Applications 목록 확인 | \`${proj}-<svc>\` 앱 생성됨 |
+| 4 | 서비스 폴더 삭제 시 App 삭제 | 폴더 삭제 후 push → Applications 확인 | 해당 앱 삭제됨 (prune) |
+| 5 | Sync 상태 | Applications → 각 앱의 Sync Status | Synced |
+| 6 | Health 상태 | Applications → 각 앱의 Health Status | Healthy |
+| 7 | Pod Ready | \`kubectl get pods -n ${ns}\` | 모든 Pod Running |
+
+---
+
+## 4. 실제 배포 루프 검증
+
+최소 1회 이상 다음 흐름을 확인합니다:
+
+\`\`\`
+Git Push (main 브랜치)
+  → GitHub Actions 워크플로우 실행 (이미지 빌드 + GHCR push)
+    → kustomization.yaml 이미지 태그 자동 갱신
+      → Argo CD 자동 Sync 감지
+        → Pod Rolling Update
+          → Pod Ready (Readiness Probe 통과)
+\`\`\`
+
+### 검증 명령:
+\`\`\`bash
+# GitHub Actions 상태 확인
+gh run list --repo <owner>/<repo> --limit 3
+
+# Argo CD Application sync 상태
+kubectl get applications -n argocd -l grad-deploy/project=${proj}
+
+# Pod 상태
+kubectl get pods -n ${ns} -o wide
+
+# 전체 이벤트 (최근 5분)
+kubectl get events -n ${ns} --sort-by='.lastTimestamp' | tail -20
+\`\`\`
+
+---
+
+## 5. 발표 당일 체크리스트
+
+발표 시작 전 다음 항목을 순서대로 확인합니다.
+
+### 사전 점검 (발표 30분 전)
+
+- [ ] \`bash scripts/check-admin-cluster.sh\` 실행 — 모든 항목 PASS
+- [ ] \`bash scripts/check-argocd-status.sh\` 실행 — admin 접속 확인
+- [ ] \`bash scripts/check-applicationset.sh\` 실행 — ApplicationSet 정상
+- [ ] Argo CD UI 접속 확인 (port-forward 또는 tunnel)
+- [ ] 전체 Application이 Synced + Healthy 인지 확인
+- [ ] Mini Board frontend에 브라우저로 접속 가능한지 확인
+
+### 시연 중 장애 대응
+
+- [ ] Pod가 비정상 → \`kubectl describe pod <pod> -n ${ns}\`
+- [ ] Sync 실패 → Argo CD UI에서 Manual Sync 시도
+- [ ] 이미지 Pull 실패 → imagePullSecret 확인
+- [ ] 발표 중 URL 변경 → \`cloudflared tunnel\` 재시작
+
+### 시연 후 정리
+
+- [ ] 임시 port-forward / tunnel 종료
+- [ ] 테스트 데이터 정리 (필요 시)
+
+---
+
+## 6. 스크립트 실행 순서
+
+\`\`\`bash
+# 1단계: 클러스터 환경 확인
+bash scripts/check-admin-cluster.sh
+
+# 2단계: Argo CD 상태 확인
+bash scripts/check-argocd-status.sh
+
+# 3단계: ApplicationSet 검증
+bash scripts/check-applicationset.sh
+\`\`\`
+
+세 스크립트 모두 PASS이면 운영 환경이 정상입니다.
+`
+}
+
 // ── 전체 파일 맵 빌드 (DeployPanel에서 호출) ──────────
 //
 // [변경] 파일 경로 계층 구조 (Multi-tenant 명명 규칙):
@@ -1895,6 +2593,18 @@ echo "   rm k8s/projects/\${PROJ}/docs/bootstrap.sh"
 
   // 배포 순서 안내 README — ApplicationSet 흐름으로 업데이트됨
   files[[projRoot, 'docs', 'deploy-order.md'].join('/')] = genDeployOrderReadme(proj, ns)  // [변경] projRoot 하위
+
+  // ── [Task 1] 운영 환경 검증 산출물 ─────────────────
+  // §2.1 클러스터 환경 확인 스크립트
+  files['scripts/check-admin-cluster.sh']    = genCheckAdminCluster(proj, ns)
+  // §2.2 Argo CD admin 상태 확인 스크립트
+  files['scripts/check-argocd-status.sh']    = genCheckArgoCDStatus(proj, ns)
+  // §2.3 ApplicationSet 검증 스크립트
+  files['scripts/check-applicationset.sh']   = genCheckApplicationSet(proj, ns)
+  // §2.4 장애 상태별 확인 루틴 문서
+  files[[projRoot, 'docs', 'troubleshooting-guide.md'].join('/')] = genTroubleshootingGuide(proj, ns)
+  // §2.2 + §4 Admin 운영 절차 + 체크리스트 통합 문서
+  files[[projRoot, 'docs', 'admin-ops-guide.md'].join('/')]       = genAdminOpsGuide(proj, ns)
 
   return files
 }
