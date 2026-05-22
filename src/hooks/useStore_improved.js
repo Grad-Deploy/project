@@ -171,108 +171,6 @@ function reducer(s, a) {
         expandedSvcIds: { ...s.expandedSvcIds, [a.id]: !s.expandedSvcIds[a.id] },
       }
 
-    case 'ADD_MINIBOARD_PRESET': {
-      const postgres = {
-        id: uid(),
-        name: 'postgres-svc',
-        type: 'postgresql',
-        image: '',
-        port: 5432,
-        replicas: 1,
-        cpuReq: '250m',
-        memReq: '512Mi',
-        cpuLim: '500m',
-        memLim: '1Gi',
-        hpa: false,
-        maxRep: 4,
-        hpaWindow: false,
-        pdbMin: '',
-        liveness: '',
-        readiness: '',
-        startupProbe: false,
-        deps: [],
-        env: {
-          POSTGRES_DB: 'board',
-          POSTGRES_USER: 'board_user',
-          POSTGRES_PASSWORD: 'board_password'
-        },
-        expose: false,
-        ingressPath: '',
-        antiAffinity: false,
-        storageClass: '',
-        storageSize: '10Gi',
-        privileged: false
-      }
-
-      const backend = {
-        id: uid(),
-        name: 'backend-svc',
-        type: 'node-backend',
-        image: '',
-        port: 3000,
-        replicas: 1,
-        cpuReq: '100m',
-        memReq: '256Mi',
-        cpuLim: '',
-        memLim: '512Mi',
-        hpa: false,
-        maxRep: 4,
-        hpaWindow: false,
-        pdbMin: '',
-        liveness: '/healthz',
-        readiness: '/ready',
-        startupProbe: false,
-        deps: ['postgres-svc'],
-        env: {},
-        expose: false,
-        ingressPath: '/api',
-        antiAffinity: false,
-        storageClass: '',
-        storageSize: '10Gi',
-        privileged: false,
-        miniBoard: true
-      }
-
-      const frontend = {
-        id: uid(),
-        name: 'frontend-svc',
-        type: 'react-nginx',
-        image: '',
-        port: 80,
-        replicas: 1,
-        cpuReq: '50m',
-        memReq: '128Mi',
-        cpuLim: '200m',
-        memLim: '256Mi',
-        hpa: false,
-        maxRep: 4,
-        hpaWindow: false,
-        pdbMin: '',
-        liveness: '/',
-        readiness: '/',
-        startupProbe: false,
-        deps: ['backend-svc'],
-        env: {},
-        expose: true,
-        ingressPath: '/',
-        antiAffinity: false,
-        storageClass: '',
-        storageSize: '10Gi',
-        privileged: false,
-        miniBoard: true
-      }
-
-      const services = [frontend, backend, postgres]
-      const expanded = {}
-      services.forEach(svc => { expanded[svc.id] = true })
-
-      return {
-        ...s,
-        services,
-        expandedSvcIds: expanded
-      }
-    }
-
     case 'SET':
       return { ...s, ...a.patch }
 
@@ -320,7 +218,6 @@ export function useStore() {
   const delSvc = useCallback(id => dispatch({ type: 'DEL_SVC', id }), [])
   const updSvc = useCallback((id, patch) => dispatch({ type: 'UPD_SVC', id, patch }), [])
   const toggleSvc = useCallback(id => dispatch({ type: 'TOGGLE_SVC', id }), [])
-  const addMiniBoardPreset = useCallback(() => dispatch({ type: 'ADD_MINIBOARD_PRESET' }), [])
 
   return {
     state,
@@ -333,6 +230,6 @@ export function useStore() {
     delSvc,
     updSvc,
     toggleSvc,
-    addMiniBoardPreset,
+
   }
 }

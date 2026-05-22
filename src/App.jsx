@@ -34,7 +34,7 @@ const CLOUD_OPTIONS = [
 ]
 
 export default function App() {
-  const { state, engineResult, propagatedServices, envIssues, resourceWarnings, set, addSvc, delSvc, updSvc, toggleSvc, addMiniBoardPreset } = useStore()
+  const { state, engineResult, propagatedServices, envIssues, resourceWarnings, set, addSvc, delSvc, updSvc, toggleSvc } = useStore()
   const [copied, setCopied] = useState(false)
 
   const yamlContent = useMemo(() => {
@@ -250,35 +250,6 @@ export default function App() {
                       ({state.services.length})
                     </span>
                   </span>
-                  <button
-                    onClick={addMiniBoardPreset}
-                    style={{
-                      marginLeft: 12,
-                      fontSize: 10,
-                      fontWeight: 700,
-                      color: '#ffffff',
-                      background: 'linear-gradient(135deg, #4f46e5, #3b82f6)',
-                      border: 'none',
-                      padding: '4px 10px',
-                      borderRadius: 6,
-                      cursor: 'pointer',
-                      boxShadow: '0 2px 6px rgba(79, 70, 229, 0.3)',
-                      transition: 'all 0.2s ease',
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: 4
-                    }}
-                    onMouseEnter={e => {
-                      e.currentTarget.style.transform = 'scale(1.05)';
-                      e.currentTarget.style.boxShadow = '0 4px 12px rgba(79, 70, 229, 0.5)';
-                    }}
-                    onMouseLeave={e => {
-                      e.currentTarget.style.transform = 'none';
-                      e.currentTarget.style.boxShadow = '0 2px 6px rgba(79, 70, 229, 0.3)';
-                    }}
-                  >
-                    ✨ 미니보드 프리셋
-                  </button>
                 </div>
                 <div style={{ display: 'flex', gap: 5 }}>
                   {Object.entries(SERVICE_TEMPLATES).map(([k, t]) => (

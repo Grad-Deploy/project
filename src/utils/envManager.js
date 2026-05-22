@@ -734,19 +734,7 @@ ${configEntries.length
  * .gitignore로 보호되며 실제 값은 GitHub Actions Secrets에서 주입
  * Next.js NEXT_PUBLIC_ 변수는 Secret이 아닌 Docker ARG로 주입되므로 제외
  */
-export const MINIBOARD_SECRET_MODE = 'B' // 'A'로 설정 시 기존 개별 Secret 주입 동작으로 전환 가능
-
 export function resolveGithubSecretName(k, svc) {
-  if (MINIBOARD_SECRET_MODE === 'B') {
-    const keyLower = k.toLowerCase()
-    // postgresql의 패스워드와 백엔드의 DB_PASSWORD를 단일 공유 Secret으로 통일
-    if (
-      (svc.type === 'postgresql' && keyLower === 'postgres_password') ||
-      (svc.type === 'node-backend' && keyLower === 'db_password')
-    ) {
-      return 'MINIBOARD_DB_PASSWORD'
-    }
-  }
   return k.toUpperCase()
 }
 
@@ -754,10 +742,7 @@ export function genSecretFile(svc, ns) {
   let { secretEntries } = splitEnvEntries(svc.env || {}, svc.type)
   if (!secretEntries.length) return null
 
-  // B안(공유 Secret 모드)일 때, 백엔드의 DATABASE_URL은 GitHub Secrets에서 중복 주입받지 않도록 제외
-  if (MINIBOARD_SECRET_MODE === 'B' && svc.type === 'node-backend') {
-    secretEntries = secretEntries.filter(([k]) => k.toLowerCase() !== 'database_url')
-  }
+
 
   if (!secretEntries.length) return null
 
