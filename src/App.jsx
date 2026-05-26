@@ -324,7 +324,7 @@ export default function App() {
               />
             </div>
 
-            {state.tab === 'credit' && <CreditPanel services={state.services} />}
+            {state.tab === 'credit' && <CreditPanel services={state.services} availableCPU={state.caAvailableCPU} availableMem={state.caAvailableMem} />}
             {state.tab === 'demo' && <DemoMode services={state.services} proj={state.proj} ns={state.ns} />}
             {state.tab === 'deploy' && <DeployPanel state={state} engineResult={engineResult} set={set} />}
           </div>

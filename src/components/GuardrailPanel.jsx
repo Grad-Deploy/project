@@ -55,32 +55,62 @@ export default function GuardrailPanel({ result }) {
         </div>
       )}
 
-      {/* 이슈 목록 */}
-      {issues.map(issue=>{
-        const cfg  = SEV[issue.severity]||SEV.WARNING
-        const eng  = ENGINE_META[issue.engine]||{}
-        return (
-          <div key={issue.id} style={{
-            background:cfg.bg, border:`1px solid ${cfg.bd}`, borderRadius:'var(--r)',
-            padding:'12px 14px',
-          }}>
-            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
-              <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                <span style={{ fontSize:13, color:cfg.color }}>{cfg.icon}</span>
-                <span style={{ fontSize:11, color:eng.color, fontWeight:700 }}>{issue.engine}</span>
-                <span style={{ fontSize:11, color:'var(--t3)' }}>· {issue.rule}</span>
-              </div>
-              <span style={{
-                fontSize:10, fontWeight:700, letterSpacing:'0.06em',
-                color:cfg.color, background:`${cfg.color}18`,
-                padding:'2px 7px', borderRadius:3,
-              }}>{issue.severity}</span>
-            </div>
-            <div style={{ fontSize:13, color:'var(--t1)', lineHeight:1.55, marginBottom:5 }}>{issue.message}</div>
-            <div style={{ fontSize:12, color:'var(--t3)' }}>→ {issue.suggestion}</div>
+      {/* 배포 차단 경고 배너 */}
+      {counts.errors > 0 && (
+        <div style={{
+          padding: '16px', borderRadius: 'var(--r2)',
+          background: 'rgba(248,113,113,0.1)', border: '1px solid rgba(248,113,113,0.4)',
+          color: 'var(--red)', fontSize: 13, fontWeight: 600,
+          display: 'flex', alignItems: 'center', gap: 10
+        }}>
+          <span style={{ fontSize: 20 }}>✕</span>
+          <div>
+            <div style={{ fontSize: 14 }}>배포가 차단되었습니다.</div>
+            <div style={{ fontSize: 11, fontWeight: 400, marginTop: 4, opacity: 0.8 }}>해결해야 할 Error 가드레일 위반이 {counts.errors}건 있습니다.</div>
           </div>
-        )
-      })}
+        </div>
+      )}
+
+      {/* 엔진별 이슈 목록 */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        {Object.entries(ENGINE_META).map(([eng, meta]) => {
+          const engIssues = issues.filter(i => i.engine === eng)
+          if (engIssues.length === 0) return null
+          
+          return (
+            <div key={eng} style={{ border: `1px solid ${meta.color}30`, borderRadius: 'var(--r)', overflow: 'hidden' }}>
+              <div style={{ background: `${meta.color}15`, padding: '8px 12px', fontSize: 13, fontWeight: 700, color: meta.color }}>
+                {eng} 엔진 ({engIssues.length}건)
+              </div>
+              <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {engIssues.map(issue => {
+                  const cfg  = SEV[issue.severity]||SEV.WARNING
+                  return (
+                    <div key={issue.id} style={{
+                      background:cfg.bg, border:`1px solid ${cfg.bd}`, borderRadius:'var(--r)',
+                      padding:'12px 14px',
+                    }}>
+                      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
+                        <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                          <span style={{ fontSize:13, color:cfg.color }}>{cfg.icon}</span>
+                          <span style={{ fontSize:11, color:'var(--t3)' }}>{issue.rule}</span>
+                        </div>
+                        <span style={{
+                          fontSize:10, fontWeight:700, letterSpacing:'0.06em',
+                          color:cfg.color, background:`${cfg.color}18`,
+                          padding:'2px 7px', borderRadius:3,
+                        }}>{issue.severity}</span>
+                      </div>
+                      <div style={{ fontSize:13, color:'var(--t1)', lineHeight:1.55, marginBottom:5 }}>{issue.message}</div>
+                      <div style={{ fontSize:12, color:'var(--t3)' }}>→ {issue.suggestion}</div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }

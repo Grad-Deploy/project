@@ -50,7 +50,7 @@ function Bar({ ratio, color, height = 6 }) {
   )
 }
 
-export default function CreditPanel({ services }) {
+export default function CreditPanel({ services, availableCPU, availableMem }) {
   const [credit, setCredit] = useState(100)     // 잔여 크레딧 USD
   const [demoDate, setDemoDate] = useState('')  // 발표일 (YYYY-MM-DD)
 
@@ -148,20 +148,26 @@ export default function CreditPanel({ services }) {
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
               <span style={{ fontSize: 11, color: 'var(--t2)' }}>총 CPU Request</span>
-              <span style={{ fontSize: 11, color: 'var(--blue)', fontFamily: 'var(--mono)' }}>
-                {totalCPU.toFixed(2)} vCPU
+              <span style={{ fontSize: 11, color: availableCPU && totalCPU > (availableCPU/1000) ? 'var(--red)' : 'var(--blue)', fontFamily: 'var(--mono)' }}>
+                {totalCPU.toFixed(2)} vCPU {availableCPU && `/ ${(availableCPU/1000).toFixed(2)} vCPU`}
               </span>
             </div>
-            <Bar ratio={totalCPU / 4} color="var(--blue)" />
+            <Bar ratio={availableCPU ? totalCPU / (availableCPU/1000) : totalCPU / 4} color={availableCPU && totalCPU > (availableCPU/1000) ? 'var(--red)' : 'var(--blue)'} />
+            {availableCPU && totalCPU > (availableCPU/1000) && (
+              <div style={{ fontSize: 11, color: 'var(--red)', marginTop: 4 }}>⚠ 클러스터 CPU 가용량을 초과했습니다. 배포 시 Pending 상태에 빠질 수 있습니다.</div>
+            )}
           </div>
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
               <span style={{ fontSize: 11, color: 'var(--t2)' }}>총 Memory Request</span>
-              <span style={{ fontSize: 11, color: 'var(--purple)', fontFamily: 'var(--mono)' }}>
-                {(totalMemMiB / 1024).toFixed(2)} GiB
+              <span style={{ fontSize: 11, color: availableMem && totalMemMiB > availableMem ? 'var(--red)' : 'var(--purple)', fontFamily: 'var(--mono)' }}>
+                {(totalMemMiB / 1024).toFixed(2)} GiB {availableMem && `/ ${(availableMem / 1024).toFixed(2)} GiB`}
               </span>
             </div>
-            <Bar ratio={totalMemMiB / (8 * 1024)} color="var(--purple)" />
+            <Bar ratio={availableMem ? totalMemMiB / availableMem : totalMemMiB / (8 * 1024)} color={availableMem && totalMemMiB > availableMem ? 'var(--red)' : 'var(--purple)'} />
+            {availableMem && totalMemMiB > availableMem && (
+              <div style={{ fontSize: 11, color: 'var(--red)', marginTop: 4 }}>⚠ 클러스터 Memory 가용량을 초과했습니다. 배포 시 Pending 상태에 빠질 수 있습니다.</div>
+            )}
           </div>
         </div>
       </section>
