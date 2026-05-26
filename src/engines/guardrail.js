@@ -120,11 +120,28 @@ const parseMilliCPU = v => {
   return parseFloat(v) * 1000
 }
 
+const parseMiB = v => {
+  if (!v) return 0
+  if (String(v).endsWith('Gi')) return parseFloat(v) * 1024
+  if (String(v).endsWith('Mi')) return parseFloat(v)
+  return parseFloat(v)
+}
+
 // ── RA — Resource Advisor ──────────────────────────────
-export function runRA(services) {
+export function runRA(services, opts = {}) {
   const issues = []
+  let totalReqCPU = 0
+  let totalReqMem = 0
+
   services.forEach(svc => {
     const t = SERVICE_TEMPLATES[svc.type] || {}
+    const rep = parseInt(svc.replicas) || 1
+    const reqCPU = parseMilliCPU(svc.cpuReq) || parseMilliCPU(t.cpuReq) || 0
+    const reqMem = parseMiB(svc.memReq) || parseMiB(t.memReq) || 0
+    
+    totalReqCPU += (reqCPU * rep)
+    totalReqMem += (reqMem * rep)
+
     if (!svc.cpuReq && !svc.memReq)
       issues.push(mk('RA', SEVERITY.WARNING, 'RA-01',
         `[${svc.name}] CPU/Memory Request 미설정 — BestEffort QoS`,
@@ -141,12 +158,24 @@ export function runRA(services) {
         'Limit을 Request의 최소 2배 이상으로 설정하세요.', 'cpuLim'))
 
     // RA-04: 멀티 레플리카인데 AntiAffinity 미설정 (kind 멀티 노드 환경)
-    const rep = parseInt(svc.replicas) || 1
     if (!t.isDB && rep > 1 && !svc.antiAffinity)
       issues.push(mk('RA', SEVERITY.WARNING, 'RA-04',
         `[${svc.name}] replicas(${rep}) > 1 이지만 AntiAffinity 미설정`,
         'kind 멀티 노드에서 Pod가 같은 노드에 몰릴 수 있습니다. AntiAffinity를 활성화하세요.', 'antiAffinity'))
   })
+
+  // RA-05, RA-06: 클러스터 가용 리소스 대비 총 요청량 검사
+  if (opts.availableCPU && totalReqCPU > opts.availableCPU) {
+    issues.push(mk('RA', SEVERITY.ERROR, 'RA-05',
+      `전체 CPU Request(${totalReqCPU}m)가 클러스터 할당 가능량(${opts.availableCPU}m) 초과`,
+      '클러스터 용량 부족으로 Pod가 Pending 상태에 빠집니다. 노드를 추가하거나 Request/Replica를 줄이세요.'))
+  }
+  if (opts.availableMem && totalReqMem > opts.availableMem) {
+    issues.push(mk('RA', SEVERITY.ERROR, 'RA-06',
+      `전체 Memory Request(${totalReqMem}Mi)가 클러스터 할당 가능량(${opts.availableMem}Mi) 초과`,
+      '클러스터 용량 부족으로 Pod가 Pending 상태에 빠집니다. 노드를 추가하거나 Request/Replica를 줄이세요.'))
+  }
+
   return issues
 }
 
@@ -255,6 +284,18 @@ export function runNA(services, opts = {}) {
       'kind Ingress Controller는 nginx를 통해 백엔드로 트래픽을 전달합니다.',
       null))
 
+  // NA-05: Ingress serviceName mismatch
+  services.forEach(svc => {
+    if (svc.ingressServiceName) {
+      const backendExists = services.some(s => s.name === svc.ingressServiceName)
+      if (!backendExists) {
+        issues.push(mk('NA', SEVERITY.ERROR, 'NA-05',
+          `[${svc.name}] Ingress 백엔드 서비스명('${svc.ingressServiceName}') 불일치`,
+          'Ingress 라우팅 대상 서비스가 클러스터에 존재하지 않아 502/503 에러가 발생합니다.', 'ingressServiceName'))
+      }
+    }
+  })
+
   detectCycles(services).forEach(c =>
     issues.push(mk('NA', SEVERITY.ERROR, 'NA-04',
       `순환 의존성: ${c.join(' → ')}`,
@@ -278,6 +319,20 @@ export function runVE(services, opts = {}) {
         `[${svc.name}] Privileged 모드 — 호스트 전체 접근 권한`,
         '반드시 필요한 경우가 아니면 제거하세요.', 'privileged'))
 
+    // VE-02: selector vs matchLabels 불일치
+    if (svc.selector && svc.matchLabels && svc.selector !== svc.matchLabels) {
+      issues.push(mk('VE', SEVERITY.ERROR, 'VE-02',
+        `[${svc.name}] selector와 matchLabels 불일치`,
+        'Deployment의 selector와 matchLabels가 다르면 생성되지 않거나 다른 Pod를 잘못 선택하게 됩니다.', 'selector'))
+    }
+
+    // VE-04: private registry 사용 시 imagePullSecrets 누락
+    if (opts.registry === 'dockerhub' && !svc.imagePullSecrets) {
+      issues.push(mk('VE', SEVERITY.WARNING, 'VE-04',
+        `[${svc.name}] Private Registry(Docker Hub) 사용 가능성 대비 imagePullSecrets 누락`,
+        '비공개 이미지를 사용할 경우 ImagePullBackOff 장애가 발생합니다. imagePullSecrets를 설정하세요.', 'imagePullSecrets'))
+    }
+
     // VE-03: 클라우드 환경별 StorageClass 미지정 경고
     if (t.isDB && !svc.storageClass) {
       if (opts.cloud === 'aws')
@@ -298,7 +353,7 @@ export function runVE(services, opts = {}) {
 export function runAllEngines(services, opts = {}) {
   _id = 0
   const all = [
-    ...runRA(services),
+    ...runRA(services, opts),
     ...runGE(services),
     ...runPG(services),
     ...runNA(services, opts),

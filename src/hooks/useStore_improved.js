@@ -97,6 +97,10 @@ const INIT = {
   tab: 'services',
   previewFile: 'manifest',
   expandedSvcIds: {},
+  
+  // Cluster Advisor State
+  caAvailableCPU: null,
+  caAvailableMem: null,
 
   // SSO / Argo CD 연동 (역할2 — SsoSetupSection 에서 set()으로 저장)
   argocdServer: import.meta.env.VITE_DEFAULT_ARGOCD_SERVER || '',   // Argo CD 서버 URL — Tab A/B 공유
@@ -188,8 +192,14 @@ export function useStore() {
 
   // ── 가드레일 엔진 실행 ─────────────────────────────
   const engineResult = useMemo(
-    () => runAllEngines(state.services, { netPolicy: state.netPolicy, cloud: state.cloud }),
-    [state.services, state.netPolicy, state.cloud]
+    () => runAllEngines(state.services, { 
+      netPolicy: state.netPolicy, 
+      cloud: state.cloud,
+      availableCPU: state.caAvailableCPU,
+      availableMem: state.caAvailableMem,
+      registry: state.registry,
+    }),
+    [state.services, state.netPolicy, state.cloud, state.caAvailableCPU, state.caAvailableMem, state.registry]
   )
 
   // ── 환경변수 전파 (의존성 기반) ──────────────────────

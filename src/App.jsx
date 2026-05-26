@@ -6,6 +6,7 @@ import ServiceCard from './components/ServiceCard_integrated'
 import GuardrailPanel from './components/GuardrailPanel'
 import DeployPanel from './components/DeployPanel'
 import NetworkTopology from './components/NetworkTopology'
+import ClusterAdvisorPanel from './components/ClusterAdvisorPanel'
 import CreditPanel from './components/CreditPanel'
 import DemoMode from './components/DemoMode'
 import { Select, Toggle, YamlCode } from './components/Ui'
@@ -14,6 +15,7 @@ const LEFT_TABS = [
   { key: 'services', label: '서비스', icon: '⬡' },
   { key: 'guardrail', label: '가드레일', icon: '⊕' },
   { key: 'topology', label: '토폴로지', icon: '◈' },
+  { key: 'advisor', label: '클러스터', icon: '💻' },
   { key: 'credit', label: '크레딧', icon: '◎' },
   { key: 'demo', label: '데모데이', icon: '◉' },
   { key: 'deploy', label: '배포', icon: '▶' },
@@ -313,6 +315,14 @@ export default function App() {
                 </p>
               </div>
             )}
+
+            {/* 클러스터 탭 */}
+            <div style={{ display: state.tab === 'advisor' ? 'block' : 'none' }}>
+              <ClusterAdvisorPanel 
+                onCapacityChange={({ availableCPU, availableMem }) => set({ caAvailableCPU: availableCPU, caAvailableMem: availableMem })}
+                onRunRA={() => set({ tab: 'guardrail' })}
+              />
+            </div>
 
             {state.tab === 'credit' && <CreditPanel services={state.services} />}
             {state.tab === 'demo' && <DemoMode services={state.services} proj={state.proj} ns={state.ns} />}
