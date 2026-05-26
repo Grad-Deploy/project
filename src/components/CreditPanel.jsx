@@ -1,6 +1,12 @@
 import { useState, useMemo } from 'react'
 import { SERVICE_TEMPLATES } from '../engines/guardrail'
 
+/**
+ * Cost and Credit Calculation Baseline Assumptions:
+ * - CPU/Memory: Based on AWS t3.medium (vCPU: $0.0416/h, GiB: $0.0052/h)
+ * - Replicas: Linearly multiplies the resource requests
+ * - D-Day (Demo Date): Used to calculate if current credit can sustain the daily burn rate until demo.
+ */
 // ── 리소스 → 예상 비용 계산 (AWS 기준 근사) ───────────────
 function parseMilli(v) {
   if (!v) return 0
@@ -73,9 +79,9 @@ export default function CreditPanel({ services }) {
     : 'danger'
 
   const STATUS_CFG = {
-    safe:    { color: 'var(--green)',  label: '충분', icon: '✓' },
-    warn:    { color: 'var(--amber)',  label: '주의', icon: '⚠' },
-    danger:  { color: 'var(--red)',    label: '위험', icon: '✕' },
+    safe:    { color: 'var(--green)',  label: '크레딧 충분', icon: '✓' },
+    warn:    { color: 'var(--amber)',  label: '소진 주의', icon: '⚠' },
+    danger:  { color: 'var(--red)',    label: 'D-day 전 고갈', icon: '✕' },
     unknown: { color: 'var(--t3)',     label: '-',    icon: '·' },
   }
   const sc = STATUS_CFG[status]
@@ -212,6 +218,10 @@ export default function CreditPanel({ services }) {
       }}>
         💡 <strong style={{ color: 'var(--blue)' }}>절약 팁:</strong> 발표 시간 외에는 replicas를 0으로 줄이거나
         미사용 서비스를 일시 중단하세요. DB StatefulSet은 PVC를 유지하며 Deployment만 삭제 가능합니다.
+      </div>
+
+      <div style={{ fontSize: 10, color: 'var(--t3)', textAlign: 'center', marginTop: 4, lineHeight: 1.4 }}>
+        * 예상 비용은 AWS t3.medium 단가를 기준으로 CPU, Memory Request 및 Replica 수량을 곱하여 산정된 근사치입니다.
       </div>
     </div>
   )
