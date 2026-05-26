@@ -457,6 +457,30 @@ export default function DeployPanel({ state, engineResult, set }) {
 
       // 3. 파일 push
       const pushResults = await ghPushFiles(pat, owner, repo, files)
+      const pushFailed = pushResults.some(r => !r.ok)
+
+      if (pushFailed) {
+        const firstFailure = pushResults.find(r => !r.ok)
+        setResults({
+          repo: `${owner}/${repo}`,
+          files: pushResults,
+          secrets: [],
+          registry,
+          pushOk: false,
+          argoSetup: null,
+          argoSetupError: [
+            `파일 Push 실패: ${firstFailure?.path || 'unknown'}`,
+            firstFailure?.status ? `(HTTP ${firstFailure.status})` : '',
+            firstFailure?.message || firstFailure?.error || '',
+            `GitHub PAT에 repo contents 쓰기 권한이 있는지 확인하세요.`,
+          ].filter(Boolean).join(' '),
+          argoServerUrl: state.argocdServer,
+          bootstrapCmd: null,
+          bootstrap: null,
+          bootstrapError: null,
+        })
+        return
+      }
 
       // 4. Docker Hub 모드면 Secrets 등록
       const secretsResults = []
@@ -571,13 +595,14 @@ export default function DeployPanel({ state, engineResult, set }) {
 
       // 복사할 원라인 명령어셋 구성 (pure URL 및 올바른 pat 변수 사용)
       const safeProjectName = toK8sName(state.proj)
-      const dynamicBootstrapCmd = `kubectl create secret generic ${safeProjectName}-git-repo-creds -n argocd --from-literal=type="git" --from-literal=url="${repoUrl}" --from-literal=username="${ghUser.login}" --from-literal=password="${pat}" --dry-run=client -o yaml | kubectl apply --validate=false -f - && kubectl label secret ${safeProjectName}-git-repo-creds -n argocd argocd.argoproj.io/secret-type=repository --overwrite && curl -s -H "Authorization: token ${pat}" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-project.yaml" | kubectl apply --validate=false -n argocd -f - && curl -s -H "Authorization: token ${pat}" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-parent-app.yaml" | kubectl apply --validate=false -n argocd -f - && curl -s -H "Authorization: token ${pat}" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-appset.yaml" | kubectl apply --validate=false -n argocd -f -`;
+      const dynamicBootstrapCmd = `export GITHUB_PAT="<YOUR_GITHUB_PAT>" && kubectl create secret generic ${safeProjectName}-git-repo-creds -n argocd --from-literal=type="git" --from-literal=url="${repoUrl}" --from-literal=username="${ghUser.login}" --from-literal=password="$GITHUB_PAT" --dry-run=client -o yaml | kubectl apply --validate=false -f - && kubectl label secret ${safeProjectName}-git-repo-creds -n argocd argocd.argoproj.io/secret-type=repository --overwrite && curl -s -H "Authorization: token $GITHUB_PAT" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-project.yaml" | kubectl apply --validate=false -n argocd -f - && curl -s -H "Authorization: token $GITHUB_PAT" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-parent-app.yaml" | kubectl apply --validate=false -n argocd -f - && curl -s -H "Authorization: token $GITHUB_PAT" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-appset.yaml" | kubectl apply --validate=false -n argocd -f -`;
 
       setResults({
         repo: `${owner}/${repo}`,
         files: pushResults,
         secrets: secretsResults,
         registry,
+        pushOk: true,
         argoSetup: argoSetupResult,
         argoSetupError,
         argoServerUrl: state.argocdServer,
@@ -877,11 +902,22 @@ export default function DeployPanel({ state, engineResult, set }) {
           <SectionHead>배포 결과</SectionHead>
           <div style={{
             marginTop: 10, padding: '10px 12px', borderRadius: 'var(--r)',
-            background: 'rgba(74,222,128,0.07)', border: '1px solid rgba(74,222,128,0.25)',
+            background: results.pushOk === false ? 'rgba(248,113,113,0.06)' : 'rgba(74,222,128,0.07)',
+            border: `1px solid ${results.pushOk === false ? 'rgba(248,113,113,0.3)' : 'rgba(74,222,128,0.25)'}`,
           }}>
-            <div style={{ fontSize: 12, color: 'var(--green)', fontWeight: 600, marginBottom: 6 }}>
-              ✓ Push 완료 → {results.repo}
+            <div style={{
+              fontSize: 12,
+              color: results.pushOk === false ? 'var(--red)' : 'var(--green)',
+              fontWeight: 600,
+              marginBottom: 6,
+            }}>
+              {results.pushOk === false ? '✕ Push 실패' : '✓ Push 완료'} → {results.repo}
             </div>
+            {results.pushOk === false && results.argoSetupError && (
+              <div style={{ fontSize: 11, color: 'var(--red)', marginBottom: 8, lineHeight: 1.5 }}>
+                {results.argoSetupError}
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 12, fontSize: 11 }}>
               <a href={`https://github.com/${results.repo}`} target="_blank" rel="noreferrer"
                 style={{ color: 'var(--blue)', textDecoration: 'underline' }}>

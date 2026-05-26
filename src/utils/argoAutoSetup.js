@@ -219,7 +219,6 @@ export async function argoCreateOrUpdateProject(serverUrl, argoToken, cfg) {
             policies: [
               `p, proj:${projectName}:deploy-role, applications, get, ${projectName}/*, allow`,
               `p, proj:${projectName}:deploy-role, applications, sync, ${projectName}/*, allow`,
-              `p, proj:${projectName}:deploy-role, applications, action, ${projectName}/*, allow`,
               `p, proj:${projectName}:deploy-role, logs, get, ${projectName}/*, allow`,
             ],
           },

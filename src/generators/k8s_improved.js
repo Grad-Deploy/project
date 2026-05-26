@@ -910,7 +910,6 @@ ${destinations}
       policies:
         - p, proj:${projectName}:deploy-role, applications, get,    ${projectName}/*, allow
         - p, proj:${projectName}:deploy-role, applications, sync,   ${projectName}/*, allow
-        - p, proj:${projectName}:deploy-role, applications, action, ${projectName}/*, allow
         - p, proj:${projectName}:deploy-role, logs,         get,    ${projectName}/*, allow
     - name: readonly-role
       description: "Read-only access to this project"
