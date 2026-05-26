@@ -1083,7 +1083,9 @@ export default function DeployPanel({ state, engineResult, set }) {
             }}>
               ✕ Argo CD 자동 연동 실패: {results.argoSetupError}
               <div style={{ fontSize: 10, color: 'var(--t3)', marginTop: 4 }}>
-                파일 Push는 완료되었습니다. Argo CD UI에서 수동으로 Application을 생성해 주세요.
+                {results.pushOk === false
+                  ? '파일 Push가 실패하여 Argo CD 자동 연동을 중단했습니다. GitHub PAT 권한을 확인한 뒤 다시 배포하세요.'
+                  : '파일 Push는 완료되었습니다. Argo CD UI에서 수동으로 Application을 생성해 주세요.'}
               </div>
             </div>
           )}
