@@ -9,6 +9,7 @@ import {
   genArgoCDApp,
   genBaseKustomization,
   genOverlayKustomization,
+  toK8sName,
 } from '../generators/k8s_improved'
 import { encryptForGithub } from '../utils/sealedBox'
 import { argoAutoSetup } from '../utils/argoAutoSetup'
@@ -75,6 +76,25 @@ async function ghFetchExistingServices(pat, owner, repo) {
     const matches = [...text.matchAll(/^  build-([\w-]+):/gm)]
     return matches.map(m => m[1])
   } catch (_) { return [] }
+}
+
+async function ghFetchExistingProjects(pat, owner, repo) {
+  try {
+    const r = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/contents/k8s/projects`,
+      { headers: { Authorization: `token ${pat}`, Accept: 'application/vnd.github.v3+json' } }
+    )
+    if (r.status === 404) return []
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}))
+      throw new Error(`기존 프로젝트 목록 조회 실패 (${r.status}): ${err.message || ''}`)
+    }
+    const entries = await r.json()
+    if (!Array.isArray(entries)) return []
+    return entries.filter(e => e.type === 'dir').map(e => e.name)
+  } catch (e) {
+    throw new Error(`기존 repo 프로젝트 확인 실패: ${e.message}`)
+  }
 }
 
 async function ghPushFiles(pat, owner, repo, files) {
@@ -197,8 +217,20 @@ async function argoFetchToken(serverUrl, username, password) {
     )
   }
   if (!r.ok) {
-    const err = await r.json().catch(() => ({}))
-    throw new Error(`Argo CD 인증 실패 (${r.status}): ${err.message || '서버 URL과 계정 정보를 확인하세요'}`)
+    const json = await r.clone().json().catch(() => null)
+    const parts = []
+    if (json && typeof json === 'object') {
+      if (json.error) parts.push(json.error)
+      if (json.message && json.message !== json.error) parts.push(json.message)
+      if (json.hint) parts.push(`hint: ${json.hint}`)
+      if (json.target) parts.push(`target: ${json.target}`)
+    }
+    const text = parts.length === 0 ? (await r.clone().text().catch(() => '')).trim() : parts.join(' | ')
+    const statusHint =
+      r.status === 401 || r.status === 403
+        ? 'admin 계정 또는 비밀번호를 확인하세요'
+        : 'Argo CD 서버 URL, 프록시, 또는 project/repo 이름을 확인하세요'
+    throw new Error(`Argo CD 요청 실패 (${r.status}): ${text || statusHint}`)
   }
   const { token } = await r.json()
   if (!token) throw new Error('서버에서 토큰을 받지 못했습니다')
@@ -347,6 +379,28 @@ export default function DeployPanel({ state, engineResult, set }) {
       // ── [수정] 대소문자 스트릭트 매칭 문제를 해결하기 위해 소문자 정규화 ──
       const repoUrl = `https://github.com/${owner}/${repo}`.toLowerCase();
       const rawRepoUrl = `https://raw.githubusercontent.com/${owner}/${repo}`.toLowerCase();
+      const projectName = (state.proj || '').trim()
+      const argoProjectName = toK8sName(projectName)
+
+      if (!projectName) {
+        throw new Error('프로젝트명을 입력하세요.')
+      }
+
+      if (deployMode === 'existing') {
+        const existingProjects = await ghFetchExistingProjects(pat, owner, repo)
+        const staleProjects = existingProjects.filter(p => p !== projectName && toK8sName(p) !== argoProjectName)
+        if (staleProjects.length > 0) {
+          throw new Error(
+            [
+              `기존 repo에 다른 Grad-Deploy 프로젝트가 남아 있습니다.`,
+              `selected repo: ${owner}/${repo}`,
+              `current project: ${projectName} (Argo/K8s name: ${argoProjectName})`,
+              `existing projects: ${existingProjects.join(', ')}`,
+              `hint: k8s/projects/${staleProjects[0]} 같은 이전 산출물을 삭제하거나, 프로젝트명을 기존 repo와 맞춘 뒤 다시 배포하세요.`,
+            ].join(' ')
+          )
+        }
+      }
 
       // 2. 기존 ci.yml에서 서비스 목록을 읽어 현재 서비스와 병합
       //    (2차 이후 push 시 이전 서비스 job이 사라지는 문제 방지)
@@ -482,32 +536,9 @@ export default function DeployPanel({ state, engineResult, set }) {
       const canAutoArgo = finalArgoServer && (finalArgoPass || finalArgoToken)
 
       if (canAutoArgo) {
-        // ── 1단계: 클러스터 부트스트랩 (AppProject + ApplicationSet kubectl 적용) ──
-        // argoAutoSetup 이 Application 을 만들기 전에 AppProject 가 클러스터에
-        // 존재해야 하므로, 백엔드 /api/bootstrap 으로 먼저 kubectl 적용 수행.
-        // 백엔드: server/index.js 의 POST /api/bootstrap (Vite proxy 경유).
-        try {
-          const r = await fetch('/api/bootstrap', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              proj: state.proj,
-              repoUrl,
-              ghUser: ghUser.login,
-              pat,
-              namespace: 'argocd',
-            }),
-          })
-          bootstrapResult = await r.json()
-          if (!bootstrapResult.ok) {
-            bootstrapError = `Bootstrap 실패: ${bootstrapResult.steps?.find(s => !s.ok)?.error || 'unknown'}`
-          }
-        } catch (e) {
-          bootstrapError = `Bootstrap 통신 실패: ${e.message}`
-          bootstrapResult = { ok: false, error: e.message }
-        }
-
-        // ── 2단계: ArgoCD 자동 연동 (Repository 등록 + Application 생성 + Sync) ──
+        // 로컬 kubectl 대신 Argo CD API로 AppProject/Repository/Application을
+        // 직접 upsert한다. 클러스터가 VM에 있어도 Mac dev server 컨텍스트와
+        // 무관하게 동작해야 한다.
         try {
           argoSetupResult = await argoAutoSetup({
             argoServerUrl: finalArgoServer,
@@ -539,7 +570,8 @@ export default function DeployPanel({ state, engineResult, set }) {
       }      
 
       // 복사할 원라인 명령어셋 구성 (pure URL 및 올바른 pat 변수 사용)
-      const dynamicBootstrapCmd = `kubectl create secret generic ${state.proj}-git-repo-creds -n argocd --from-literal=url="${repoUrl}" --from-literal=username="${ghUser.login}" --from-literal=password="${pat}" --dry-run=client -o yaml | kubectl apply -f - && kubectl label secret ${state.proj}-git-repo-creds -n argocd argocd.argoproj.io/secret-type=repository --overwrite && curl -s -H "Authorization: token ${pat}" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-project.yaml" | kubectl apply -n argocd -f - && curl -s -H "Authorization: token ${pat}" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-appset.yaml" | kubectl apply -n argocd -f -`;
+      const safeProjectName = toK8sName(state.proj)
+      const dynamicBootstrapCmd = `kubectl create secret generic ${safeProjectName}-git-repo-creds -n argocd --from-literal=type="git" --from-literal=url="${repoUrl}" --from-literal=username="${ghUser.login}" --from-literal=password="${pat}" --dry-run=client -o yaml | kubectl apply --validate=false -f - && kubectl label secret ${safeProjectName}-git-repo-creds -n argocd argocd.argoproj.io/secret-type=repository --overwrite && curl -s -H "Authorization: token ${pat}" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-project.yaml" | kubectl apply --validate=false -n argocd -f - && curl -s -H "Authorization: token ${pat}" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-parent-app.yaml" | kubectl apply --validate=false -n argocd -f - && curl -s -H "Authorization: token ${pat}" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-appset.yaml" | kubectl apply --validate=false -n argocd -f -`;
 
       setResults({
         repo: `${owner}/${repo}`,
@@ -908,6 +940,22 @@ export default function DeployPanel({ state, engineResult, set }) {
               </div>
             ))}
           </div>
+
+          {/* ArgoCD 자동 연동 결과 */}
+          {results.bootstrap && (
+            <div style={{
+              marginTop: 12,
+              padding: '10px 14px',
+              borderRadius: 'var(--r)',
+              background: results.bootstrap.ok ? 'rgba(74,222,128,0.05)' : 'rgba(248,113,113,0.06)',
+              border: `1px solid ${results.bootstrap.ok ? 'rgba(74,222,128,0.25)' : 'rgba(248,113,113,0.3)'}`,
+              fontSize: 11,
+              color: results.bootstrap.ok ? 'var(--green)' : 'var(--red)',
+              lineHeight: 1.6,
+            }}>
+              {results.bootstrap.ok ? '✓ Argo CD bootstrap 완료' : `✕ Argo CD bootstrap 실패: ${results.bootstrapError || results.bootstrap.error || 'unknown'}`}
+            </div>
+          )}
 
           {/* ArgoCD 자동 연동 결과 */}
           {results.argoSetup && (

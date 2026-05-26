@@ -34,6 +34,15 @@ const execAsync = promisify(exec)
 const app = express()
 app.use(express.json({ limit: '5mb' }))
 
+function toK8sName(value, fallback = 'my-app') {
+  const normalized = String(value || fallback)
+    .toLowerCase()
+    .replace(/[^a-z0-9.-]+/g, '-')
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '')
+    .replace(/[-.]{2,}/g, '-')
+  return normalized || fallback
+}
+
 const {
   ARGOCD_SERVER,
   ARGOCD_ADMIN_TOKEN,
@@ -315,18 +324,40 @@ app.use('/argocd-api', async (req, res) => {
 
     if (body) {
       forwardHeaders['content-type'] = 'application/json'
+      forwardHeaders['content-length'] = Buffer.byteLength(body)
     }
 
-    const upstream = await fetch(fullTargetUrl, {
-      method: req.method,
-      headers: forwardHeaders,
-      body,
-      redirect: 'manual',
+    const target = new URL(fullTargetUrl)
+    const isHttps = target.protocol === 'https:'
+    const mod = isHttps ? https : http
+
+    const upstream = await new Promise((resolve, reject) => {
+      const proxyReq = mod.request({
+        hostname: target.hostname,
+        port: target.port || (isHttps ? 443 : 80),
+        path: target.pathname + target.search,
+        method: req.method,
+        headers: forwardHeaders,
+        rejectUnauthorized: false,
+      }, proxyRes => {
+        const chunks = []
+        proxyRes.on('data', chunk => chunks.push(chunk))
+        proxyRes.on('end', () => {
+          resolve({
+            status: proxyRes.statusCode || 502,
+            headers: proxyRes.headers,
+            body: Buffer.concat(chunks),
+          })
+        })
+      })
+      proxyReq.on('error', reject)
+      if (body) proxyReq.write(body)
+      proxyReq.end()
     })
 
     // 응답 전달
     res.status(upstream.status)
-    upstream.headers.forEach((v, k) => {
+    Object.entries(upstream.headers).forEach(([k, v]) => {
       const lower = k.toLowerCase()
       // 압축/길이/hop-by-hop 헤더 제외 + CORS 헤더는 백엔드가 위에서 이미 설정함
       if (!['content-encoding', 'content-length', 'transfer-encoding', 'connection',
@@ -335,13 +366,17 @@ app.use('/argocd-api', async (req, res) => {
         res.setHeader(k, v)
       }
     })
-    const buf = Buffer.from(await upstream.arrayBuffer())
-    res.end(buf)
+    res.end(upstream.body)
   } catch (e) {
+    const targetHost = (() => {
+      try { return new URL(fullTargetUrl).hostname } catch (_) { return '' }
+    })()
     res.status(502).json({
       error: `ArgoCD proxy 실패: ${e.message}`,
       target: fullTargetUrl,
-      hint: 'ArgoCD URL 이 활성 상태인지, cloudflared tunnel 이 떠 있는지 확인하세요',
+      hint: targetHost === 'localhost' || targetHost === '127.0.0.1'
+        ? 'localhost 는 Grad-Deploy 백엔드 서버 기준입니다. Argo CD port-forward 가 같은 머신에서 떠 있는지 확인하세요.'
+        : 'ArgoCD URL 이 활성 상태인지, cloudflared tunnel 이 떠 있는지 확인하세요',
     })
   }
 })
@@ -388,6 +423,7 @@ app.post('/api/bootstrap', async (req, res) => {
   const env = {
     ...process.env,
     PROJ: proj,
+    SAFE_PROJ: toK8sName(proj),
     REPO_URL: repoUrl,
     RAW_URL: rawUrl,
     GH_USER: ghUser,
@@ -399,17 +435,17 @@ app.post('/api/bootstrap', async (req, res) => {
   const steps = [
     {
       name: 'Repository Secret 생성',
-      cmd: `kubectl create secret generic "\${PROJ}-git-repo-creds" \
+      cmd: `kubectl create secret generic "\${SAFE_PROJ}-git-repo-creds" \
         -n "\${NS}" \
         --from-literal=type="git" \
         --from-literal=url="\${REPO_URL}" \
         --from-literal=username="\${GH_USER}" \
         --from-literal=password="\${PAT}" \
-        --dry-run=client -o yaml | kubectl apply -f -`,
+        --dry-run=client -o yaml | kubectl apply --validate=false -f -`,
     },
     {
       name: 'Repository Secret 레이블 지정',
-      cmd: `kubectl label secret "\${PROJ}-git-repo-creds" \
+      cmd: `kubectl label secret "\${SAFE_PROJ}-git-repo-creds" \
         -n "\${NS}" \
         argocd.argoproj.io/secret-type=repository --overwrite`,
     },
@@ -417,19 +453,19 @@ app.post('/api/bootstrap', async (req, res) => {
       name: 'AppProject 적용',
       cmd: `curl -fsSL -H "Authorization: token \${PAT}" \
         "\${RAW_URL}/main/k8s/projects/\${PROJ}/argo-project.yaml" \
-        | kubectl apply -n "\${NS}" -f -`,
+        | kubectl apply --validate=false -n "\${NS}" -f -`,
     },
     {
       name: '부모 Application 적용',
       cmd: `curl -fsSL -H "Authorization: token \${PAT}" \
         "\${RAW_URL}/main/k8s/projects/\${PROJ}/argo-parent-app.yaml" \
-        | kubectl apply -n "\${NS}" -f -`,
+        | kubectl apply --validate=false -n "\${NS}" -f -`,
     },
     {
       name: 'ApplicationSet 적용',
       cmd: `curl -fsSL -H "Authorization: token \${PAT}" \
         "\${RAW_URL}/main/k8s/projects/\${PROJ}/argo-appset.yaml" \
-        | kubectl apply -n "\${NS}" -f -`,
+        | kubectl apply --validate=false -n "\${NS}" -f -`,
     },
   ]
 

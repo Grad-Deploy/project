@@ -826,7 +826,8 @@ ${services.map(s => `  - ../../services/${s.name}`).join('\n')}
   - networkpolicy.yaml
 images:
 ${services.map(s => `  - name: ${s.name}
-    newName: ${imageNameOf(s.name)}`).join('\n')}`
+    newName: ${imageNameOf(s.name)}
+    newTag: latest`).join('\n')}`
 
   // ── CI 파이프라인 파일 (.github/workflows) ──────────────
   files[['.github', 'workflows', 'ci-cd.yaml'].join('/')] = ciYaml

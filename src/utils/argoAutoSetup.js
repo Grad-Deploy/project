@@ -28,6 +28,15 @@ function normalizeArgoUrl(url) {
   return u
 }
 
+function toK8sName(value, fallback = 'my-app') {
+  const normalized = String(value || fallback)
+    .toLowerCase()
+    .replace(/[^a-z0-9.-]+/g, '-')
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '')
+    .replace(/[-.]{2,}/g, '-')
+  return normalized || fallback
+}
+
 // ── CORS 우회 Proxy 헬퍼 ────────────────────────────────
 // ArgoCD 는 외부 origin 의 API 호출을 위한 CORS 헤더를 보내지 않아
 // 브라우저에서 직접 호출하면 preflight 단계에서 차단됩니다.
@@ -76,6 +85,21 @@ function argoFetch(serverUrl, pathOrFullUrl, init = {}) {
   return fetch(`${normalized}${path}`, init)
 }
 
+async function readResponseError(res) {
+  const json = await res.clone().json().catch(() => null)
+  if (json && typeof json === 'object') {
+    const parts = []
+    if (json.error) parts.push(json.error)
+    if (json.message && json.message !== json.error) parts.push(json.message)
+    if (json.hint) parts.push(`hint: ${json.hint}`)
+    if (json.target) parts.push(`target: ${json.target}`)
+    const detail = parts.filter(Boolean).join(' | ')
+    if (detail) return detail
+  }
+  const text = await res.clone().text().catch(() => '')
+  return text.trim()
+}
+
 // ── ArgoCD 세션 토큰 획득 ───────────────────────────────
 // admin 계정 + 비밀번호로 단기 세션 토큰 발급
 // (이미 토큰을 가진 경우엔 이 단계 스킵 가능)
@@ -93,8 +117,14 @@ export async function argoLogin(serverUrl, username, password) {
     )
   }
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error(`Argo CD 인증 실패 (${res.status}): ${err.message || 'admin 계정 정보를 확인하세요'}`)
+    const detail = await readResponseError(res)
+    const statusHint =
+      res.status === 401 || res.status === 403
+        ? 'admin 계정 또는 토큰을 확인하세요'
+        : 'Argo CD 서버 URL, 프록시, 또는 프로젝트/권한 설정을 확인하세요'
+    throw new Error(
+      `Argo CD 요청 실패 (${res.status}): ${detail || statusHint}`
+    )
   }
   const { token } = await res.json()
   if (!token) throw new Error('Argo CD가 토큰을 반환하지 않았습니다')
@@ -148,6 +178,78 @@ export async function argoRegisterRepo(serverUrl, argoToken, repoUrl, ghUser, gh
   return { ok: true, existing: exists }
 }
 
+// ── AppProject 생성/업데이트 ────────────────────────────
+// 로컬 Mac/Vite 프로세스의 kubectl 컨텍스트에 의존하지 않고,
+// Argo CD API로 프로젝트를 먼저 upsert한다.
+export async function argoCreateOrUpdateProject(serverUrl, argoToken, cfg) {
+  const { proj, ns = 'default', repoUrl } = cfg
+  const projectName = `${toK8sName(proj)}-project`
+  const namespaces = Array.from(new Set([ns, 'argocd']))
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${argoToken}`,
+  }
+
+  const body = {
+    project: {
+      metadata: {
+        name: projectName,
+        namespace: 'argocd',
+        labels: {
+          'app.kubernetes.io/managed-by': 'grad-deploy',
+          'grad-deploy/project': String(proj),
+        },
+      },
+      spec: {
+        description: `Grad-Deploy managed project for ${proj}`,
+        sourceRepos: [repoUrl],
+        destinations: namespaces.map(namespace => ({
+          server: 'https://kubernetes.default.svc',
+          namespace,
+        })),
+        clusterResourceWhitelist: [],
+        namespaceResourceBlacklist: [
+          { group: '', kind: 'ResourceQuota' },
+          { group: '', kind: 'LimitRange' },
+        ],
+        roles: [
+          {
+            name: 'deploy-role',
+            description: 'CI pipeline role — sync and read only',
+            policies: [
+              `p, proj:${projectName}:deploy-role, applications, get, ${projectName}/*, allow`,
+              `p, proj:${projectName}:deploy-role, applications, sync, ${projectName}/*, allow`,
+              `p, proj:${projectName}:deploy-role, applications, action, ${projectName}/*, allow`,
+              `p, proj:${projectName}:deploy-role, logs, get, ${projectName}/*, allow`,
+            ],
+          },
+          {
+            name: 'readonly-role',
+            description: 'Read-only access to this project',
+            policies: [
+              `p, proj:${projectName}:readonly-role, applications, get, ${projectName}/*, allow`,
+              `p, proj:${projectName}:readonly-role, logs, get, ${projectName}/*, allow`,
+            ],
+          },
+        ],
+      },
+    },
+    upsert: true,
+  }
+
+  const res = await argoFetch(serverUrl, '/api/v1/projects?upsert=true', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  })
+
+  if (!res.ok) {
+    const detail = await readResponseError(res)
+    throw new Error(`AppProject 생성/업데이트 실패 (${res.status}): ${detail || projectName}`)
+  }
+  return { ok: true, projectName }
+}
+
 // ── Application 생성 ────────────────────────────────────
 // path: k8s/projects/${proj}/overlays/production (kustomize overlay 위치)
 // 이미 존재하면 PUT으로 업데이트, 없으면 POST로 생성
@@ -168,9 +270,10 @@ export async function argoCreateOrUpdateApp(serverUrl, argoToken, cfg) {
     Authorization: `Bearer ${argoToken}`,
   }
 
-  // AppProject 이름은 genAppProject()에서 '${proj}-project' 규칙으로 생성됨
+  // AppProject 이름은 genAppProject()와 동일하게 RFC1123-safe 이름을 사용함
   // (k8s_improved.js 의 genAppProject 참조)
-  const projectName = `${proj}-project`
+  const argoName = toK8sName(proj)
+  const projectName = `${argoName}-project`
 
   const appManifest = {
     metadata: {
@@ -184,6 +287,10 @@ export async function argoCreateOrUpdateApp(serverUrl, argoToken, cfg) {
         repoURL: repoUrl,
         targetRevision,
         path,
+        directory: {
+          recurse: false,
+          include: 'argo-appset.yaml',
+        },
       },
       destination: {
         server: 'https://kubernetes.default.svc',
@@ -234,7 +341,7 @@ export async function argoCreateOrUpdateApp(serverUrl, argoToken, cfg) {
 // k8s_improved.js의 genAppProject가 생성하는 YAML은 ArgoCD가 자동 sync
 // 하기 전엔 클러스터에 없을 수 있음 → 사전 체크해서 부드러운 에러 메시지 제공
 export async function argoCheckProject(serverUrl, argoToken, proj) {
-  const projectName = `${proj}-project`
+  const projectName = `${toK8sName(proj)}-project`
 
   const res = await argoFetch(serverUrl, `/api/v1/projects/${projectName}`, {
     headers: { Authorization: `Bearer ${argoToken}` },
@@ -309,6 +416,8 @@ export async function argoAutoSetup(cfg) {
   } = cfg
 
   const steps = []
+  const argoName = toK8sName(proj)
+  const projectName = `${argoName}-project`
   const recordStep = (name, ok, detail = '') => {
     steps.push({ name, ok, detail })
   }
@@ -359,34 +468,60 @@ export async function argoAutoSetup(cfg) {
     return { steps, ok: false, error: e.message, argoToken: token }
   }
 
-  // ── Step 3: AppProject 존재 확인 ──────────────────
-  // 없으면 부드러운 경고 — 첫 배포 시엔 root-bootstrap이 먼저 sync되어야 함
+  // ── Step 3: AppProject 생성/업데이트 ───────────────
+  // 예전 방식은 로컬 kubectl 컨텍스트에 의존했지만, 사용자의 클러스터가 VM에
+  // 있는 경우 Mac의 kubectl이 localhost:8080으로 향해 실패했다. 이제 Argo CD
+  // API로 직접 upsert해서 첫 배포에서도 Application 생성 전 프로젝트가 존재한다.
+  try {
+    const r = await argoCreateOrUpdateProject(argoServerUrl, token, {
+      proj,
+      ns,
+      repoUrl,
+    })
+    recordStep('AppProject 생성', true, `${r.projectName} 생성/업데이트 완료`)
+  } catch (e) {
+    recordStep('AppProject 생성', false, e.message)
+    return { steps, ok: false, error: e.message, argoToken: token }
+  }
+
+  // ── Step 3.5: AppProject 존재 확인 ─────────────────
   const hasProject = await argoCheckProject(argoServerUrl, token, proj).catch(() => false)
   recordStep(
     'AppProject 확인',
     hasProject,
     hasProject
-      ? `${proj}-project 존재`
-      : `${proj}-project 없음 — root bootstrap Application이 먼저 sync되어야 합니다`
+      ? `${projectName} 존재`
+      : [
+          `Argo CD 에서 ${projectName} 를 찾지 못했습니다.`,
+          `가능한 원인:`,
+          `- 프로젝트명이 실제 Argo CD 설정과 다름`,
+          `- AppProject YAML 이 아직 apply/sync 되지 않음`,
+          `- root bootstrap Application 이 아직 동기화되지 않음`,
+          `확인값: state.proj="${proj}" → expected project="${projectName}"`,
+        ].join(' ')
   )
 
   // ── Step 4: Application 생성/업데이트 ──────────────
-  // path: buildAllFiles와 k8s_improved.js의 overlayDir과 동일하게 맞춰야 함
-  // → k8s/projects/${proj}/overlays/production
-  const appPath = `k8s/projects/${proj}/overlays/production`
+  // path: buildAllFiles와 k8s_improved.js의 argoParentAppYaml과 동일하게 맞춰야 함
+  // → k8s/projects/${proj}
+  const appPath = `k8s/projects/${proj}`
   let appName
   try {
     const r = await argoCreateOrUpdateApp(argoServerUrl, token, {
-      appName: proj,            // genArgoCDApp()의 명명 규칙과 일치
+      appName: argoName,        // genArgoCDApp()의 명명 규칙과 일치
       proj,
       repoUrl,
-      ns,
+      ns: 'argocd',             // 부모 Application 은 argocd 네임스페이스에 배포됨
       path: appPath,
     })
     appName = r.appName
     recordStep('Application 생성', true, `name=${appName}, path=${appPath}`)
   } catch (e) {
-    recordStep('Application 생성', false, e.message)
+    recordStep(
+      'Application 생성',
+      false,
+      `${e.message} (expected project: ${projectName}, repo: ${repoUrl}, path: ${appPath})`
+    )
     return { steps, ok: false, error: e.message, argoToken: token }
   }
 
@@ -401,7 +536,11 @@ export async function argoAutoSetup(cfg) {
       )
     } catch (e) {
       // sync 실패는 fatal하지 않음 — automated.selfHeal이 결국 동기화함
-      recordStep('Sync 트리거', false, `${e.message} (automated sync로 대체됨)`)
+      recordStep(
+        'Sync 트리거',
+        false,
+        `${e.message} (expected app: ${appName}, project: ${projectName}, automated sync 로 대체됨)`
+      )
     }
   }
 

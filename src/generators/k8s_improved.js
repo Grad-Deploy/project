@@ -15,6 +15,36 @@
 import { SERVICE_TEMPLATES } from '../engines/guardrail'
 import { buildFileMap as envBuildFileMap } from '../utils/envManager'
 
+export function toK8sName(value, fallback = 'my-app') {
+  const normalized = String(value || fallback)
+    .toLowerCase()
+    .replace(/[^a-z0-9.-]+/g, '-')
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '')
+    .replace(/[-.]{2,}/g, '-')
+  return normalized || fallback
+}
+
+function isDbService(svc) {
+  return !!(SERVICE_TEMPLATES[svc.type] || {}).isDB
+}
+
+function generatedImageName(serviceName) {
+  return serviceName.replace(/-svc$/, '-service-v2')
+}
+
+function repoOwnerFromUrl(repoUrl) {
+  const match = String(repoUrl || '').match(/github\.com[/:]([^/]+)/i)
+  return match ? match[1].toLowerCase() : '${{ github.repository_owner }}'
+}
+
+function imageRepoForService(serviceName, { registry = 'ghcr', dockerhubUser = '', repo = '' } = {}) {
+  const imageName = generatedImageName(serviceName)
+  if (registry === 'dockerhub') {
+    return `docker.io/${dockerhubUser || 'REPLACE_DOCKERHUB_USERNAME'}/${imageName}`
+  }
+  return `ghcr.io/${repoOwnerFromUrl(repo)}/${imageName}`
+}
+
 // ── 클러스터 환경별 StorageClass 기본값 ──────────────
 const STORAGE_CLASS_DEFAULT = {
   kind:  'standard',    // kind 기본 (hostPath provisioner)
@@ -47,7 +77,8 @@ function genDeployment(svc, ns, cloud = 'kind') {
   const isDB = !!t.isDB
   const kind = isDB ? 'StatefulSet' : 'Deployment'
   const port = svc.port || t.port || 8080
-  const img = svc.image || `${svc.name}:latest`
+  const isNginxType = (svc.type === 'nginx' || svc.type === 'react-nginx')
+  const img = isDB ? (svc.image || getImageForService(svc)) : `${svc.name}:latest`
   const cpuR = svc.cpuReq || t.cpuReq || '100m'
   const memR = svc.memReq || t.memReq || '256Mi'
   const memL = svc.memLim || t.memLim || '512Mi'
@@ -70,9 +101,16 @@ function genDeployment(svc, ns, cloud = 'kind') {
     readinessProbe = httpProbeYaml(rd, port, 10, 3)
   }
 
-  const securityCtx = isDB
-    ? `runAsUser: 999`
-    : `runAsNonRoot: true\n        runAsUser: 1000`
+  const securityContextBlock = isDB
+    ? `
+      securityContext:
+        runAsUser: 999`
+    : isNginxType
+      ? ''
+      : `
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000`
 
   // ── AntiAffinity: replicas > 1 이거나 사용자가 명시적으로 활성화한 경우
   // kind 멀티 노드에서 Pod를 서로 다른 노드에 분산시킴
@@ -93,7 +131,6 @@ function genDeployment(svc, ns, cloud = 'kind') {
 
   // ── nginx / react-nginx: nginx.conf ConfigMap 볼륨 마운트
   // nginx.conf는 별도 ConfigMap({svc.name}-nginx-conf)으로 관리
-  const isNginxType = (svc.type === 'nginx' || svc.type === 'react-nginx')
   const nginxVolumeMount = isNginxType ? `
           volumeMounts:
             - name: nginx-conf
@@ -122,9 +159,7 @@ spec:
     metadata:
       labels:
         app: ${svc.name}
-    spec:
-      securityContext:
-        ${securityCtx}${affinityBlock}${nginxVolume}
+    spec:${securityContextBlock}${affinityBlock}${nginxVolume}
       containers:
         - name: ${svc.name}
           image: "${img}"
@@ -564,6 +599,7 @@ export function genGitHubActions(services, cfg = {}) {
   // ── CI 내부에서 참조하는 kustomization 경로 ──────────
   // buildAllFiles·buildFileMap의 overlayDir과 반드시 일치해야 함
   const overlayDir = ['k8s', 'projects', proj, 'overlays', 'production'].join('/')
+  const argoName = toK8sName(proj)
 
   const isGHCR = registry === 'ghcr'
   const imageNameOf = name => name.replace(/-svc$/, '-service-v2')
@@ -655,8 +691,13 @@ ${buildJobs}
 
       - name: Check for plain text Secrets
         run: |
-          if grep -r "^kind: Secret" k8s/ --include="*.yaml" 2>/dev/null | grep -v "SealedSecret"; then
+          SECRET_MATCHES=$(find "k8s/projects/${proj}" -type f -name "*.yaml" ! -name "*.example.yaml" -print0 2>/dev/null \
+            | xargs -0 grep -H "^kind: Secret" 2>/dev/null \
+            | grep -v "SealedSecret" || true)
+          if [ -n "\${SECRET_MATCHES}" ]; then
+            echo "\${SECRET_MATCHES}"
             echo "::error::평문 Secret이 발견되었습니다. SealedSecret을 사용하세요."
+            echo "::error::검사 범위: k8s/projects/${proj} (*.example.yaml 제외)"
             exit 1
           fi
           echo "✅ 평문 Secret 없음"
@@ -688,7 +729,7 @@ ${buildJobs}
           ARGOCD_AUTH_TOKEN: \${{ secrets.ARGOCD_TOKEN }}
         run: |
           HTTP_STATUS=\$(curl -s -o /tmp/sync_resp.json -w "%{http_code}" \\
-            -X POST "https://\${ARGOCD_SERVER}/api/v1/applications/${proj}/sync" \\
+            -X POST "https://\${ARGOCD_SERVER}/api/v1/applications/${argoName}/sync" \\
             -H "Authorization: Bearer \${ARGOCD_AUTH_TOKEN}" \\
             -H "Content-Type: application/json" \\
             --insecure \\
@@ -698,7 +739,7 @@ ${buildJobs}
             echo "::error::ARGOCD_TOKEN 만료. Settings → Accounts → admin → Generate New Token"
             exit 1
           elif [ "\${HTTP_STATUS}" = "404" ]; then
-            echo "::error::앱 '${proj}'이 없음. kubectl apply -f k8s/argo-app.yaml -n argocd 필요"
+            echo "::error::앱 '${argoName}'이 없음. kubectl apply -f k8s/projects/${proj}/argo-parent-app.yaml -n argocd 필요"
             exit 1
           fi`
 }
@@ -759,12 +800,14 @@ spec:
 // ArgoCD가 감시하는 경로가 buildAllFiles의 overlayDir과 일치해야 함
 export function genArgoCDApp(cfg = {}) {
   const { proj = 'my-app', repo = 'https://github.com/ORG/REPO', ns = 'default' } = cfg
+  const argoName = toK8sName(proj)
   const overlayPath = `k8s/projects/${proj}/overlays/production`
-  return genArgoApplication(proj, repo, 'HEAD', overlayPath, ns, `${proj}-project`)
+  return genArgoApplication(argoName, repo, 'HEAD', overlayPath, ns, `${argoName}-project`)
 }
 
 // ── ArgoCD Autopilot Bootstrap ────────────────────────
 export function genAutopilotBootstrap(proj, repoUrl, ns) {
+  const argoName = toK8sName(proj)
   // 1. AppProject 생성 (프로젝트 격리)
   const project = genAppProject(proj, ns, repoUrl);
   
@@ -773,10 +816,10 @@ export function genAutopilotBootstrap(proj, repoUrl, ns) {
   const rootApp = `apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: ${proj}-root-bootstrap
+  name: ${argoName}-root-bootstrap
   namespace: argocd
 spec:
-  project: ${proj}-project
+  project: ${argoName}-project
   source:
     repoURL: ${repoUrl}
     targetRevision: HEAD
@@ -809,8 +852,9 @@ spec:
 //   roles            → deploy-role: CI(ArgoCD Token)가 sync/get만 가능
 //                      역할 2에서 GitHub SSO 그룹을 이 role에 바인딩
 export function genAppProject(proj, ns, repoUrl) {
-  const projectName = `${proj}-project`
-  const namespaces = Array.isArray(ns) ? ns : [ns]
+  const argoName = toK8sName(proj)
+  const projectName = `${argoName}-project`
+  const namespaces = Array.from(new Set([...(Array.isArray(ns) ? ns : [ns]), 'argocd']))
   const destinations = namespaces.map(n => `    - server: https://kubernetes.default.svc\n      namespace: "${n}"`).join('\n')
 
   return `apiVersion: argoproj.io/v1alpha1
@@ -859,7 +903,7 @@ ${destinations}
   #
   # 역할 2(인증/RBAC)에서 GitHub SSO 그룹을 이 role에 바인딩:
   #   argocd-cm ConfigMap의 policy.csv에 추가:
-  #   g, github-org:${proj}-team, role:proj:${projectName}:deploy-role
+  #   g, github-org:${argoName}-team, role:proj:${projectName}:deploy-role
   roles:
     - name: deploy-role
       description: "CI pipeline role — sync and read only"
@@ -900,8 +944,9 @@ export function genApplicationSet(cfg = {}) {
     revision = 'HEAD',
   } = cfg
 
-  const projectName = `${proj}-project`
-  const appSetName  = `${proj}-appset`
+  const argoName    = toK8sName(proj)
+  const projectName = `${argoName}-project`
+  const appSetName  = `${argoName}-appset`
   // Git Generator가 감시하는 경로 패턴: services/* 아래의 모든 직계 폴더
   const watchPath   = `k8s/projects/${proj}/services/*`
 
@@ -937,7 +982,7 @@ spec:
   template:
     metadata:
       # 앱 이름: "<프로젝트>-<서비스폴더명>" 형태로 고유하게 생성
-      name: "${proj}-{{path.basename}}"
+      name: "${argoName}-{{path.basename}}"
       namespace: argocd
       labels:
         app.kubernetes.io/managed-by: grad-deploy
@@ -1006,12 +1051,13 @@ export function genParentApp(cfg = {}) {
     repoUrl = 'https://github.com/ORG/REPO',
   } = cfg
 
-  const projectName = `${proj}-project`
+  const argoName = toK8sName(proj)
+  const projectName = `${argoName}-project`
 
   return `apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: ${proj}
+  name: ${argoName}
   namespace: argocd
   finalizers:
     - resources-finalizer.argocd.argoproj.io
@@ -1079,7 +1125,8 @@ export function genArgoCDAdminConfig(cfg = {}) {
     argocdServer   = 'argocd.example.com',
   } = cfg
 
-  const projectName = `${proj}-project`
+  const argoName = toK8sName(proj)
+  const projectName = `${argoName}-project`
 
   // ── dex 사용자 동적 생성 ─────────────────────────
   // DeployPanel에서 입력한 사용자들의 로그인을 허용.
@@ -1173,7 +1220,7 @@ data:
   if (ssoTeams.length > 0) {
     ssoTeams.forEach(t => {
       if (!t.team) return
-      const targetProjName = t.proj ? `${t.proj}-project` : projectName;
+      const targetProjName = t.proj ? `${toK8sName(t.proj)}-project` : projectName;
       const roleName = t.role === 'admin'    ? 'role:admin'
                      : t.role === 'deploy'   ? `role:proj:${targetProjName}:deploy-role`
                      : /* readonly 기본값 */   `role:proj:${targetProjName}:readonly-role`
@@ -1259,14 +1306,27 @@ kubectl rollout status deployment argocd-dex-server -n "\${ARGOCD_NS}" --timeout
 kubectl rollout status deployment argocd-server -n "\${ARGOCD_NS}" --timeout=60s
 
 echo "▶ 5단계: deploy-role 전용 토큰 발급 안내"
-cat << 'EOF'
+EXPECTED_PROJECT_NAME="${projectName}"
+PROJECT_NAME="\${ARGOCD_PROJECT:-$EXPECTED_PROJECT_NAME}"
+
+if [ -n "\${ARGOCD_PROJECT:-}" ] && [ "$PROJECT_NAME" != "$EXPECTED_PROJECT_NAME" ]; then
+  echo "✕ 프로젝트명 불일치"
+  echo "  expected: $EXPECTED_PROJECT_NAME"
+  echo "  actual:   $PROJECT_NAME"
+  echo "  hint: ARGOCD_PROJECT 값을 비우거나, 실제 Argo CD project name 으로 맞추세요."
+  exit 1
+fi
+
+echo "  expected project: $EXPECTED_PROJECT_NAME"
+echo "  selected project : $PROJECT_NAME"
+cat <<EOF
   ────────────────────────────────────────────────────
   GitHub Secret ARGOCD_TOKEN 에는 admin 토큰 대신
   deploy-role 전용 토큰을 등록해야 합니다. (최소 권한 원칙)
 
   발급 방법 (Argo CD CLI):
     argocd login ${argocdServer}
-    argocd proj role create-token ${proj}-project deploy-role
+    argocd proj role create-token "$PROJECT_NAME" deploy-role
 
   발급한 토큰을 GitHub Repository Secret 에 등록:
     gh secret set ARGOCD_TOKEN --body "<발급된 토큰>"
@@ -1295,10 +1355,22 @@ set -e
 PROJ=$1
 TOKEN=$2
 ARGOCD_SERVER="${argocdServer}"
+EXPECTED_PROJECT_NAME="${projectName}"
+ACTUAL_PROJECT_NAME="$PROJ-project"
 
 if [ -z "$PROJ" ] || [ -z "$TOKEN" ]; then
   echo "사용법: bash test-rbac.sh <프로젝트명> <토큰>"
   echo "예시: bash test-rbac.sh my-app eyJhbGci..."
+  exit 1
+fi
+
+if [ "$ACTUAL_PROJECT_NAME" != "$EXPECTED_PROJECT_NAME" ]; then
+  echo "✕ 프로젝트명 불일치"
+  echo "  expected: $EXPECTED_PROJECT_NAME"
+  echo "  actual:   $ACTUAL_PROJECT_NAME"
+  echo "  hint: 생성된 프로젝트명과 테스트 입력값(PROJ)을 일치시키세요."
+  echo "  tip: 실제 프로젝트가 minikube-test2-project 라면"
+  echo "       bash test-rbac.sh minikube-test2 <token> 으로 실행해야 합니다."
   exit 1
 fi
 
@@ -1307,17 +1379,17 @@ echo "서버: https://$ARGOCD_SERVER"
 echo ""
 
 echo "1. 프로젝트 정보 조회 테스트"
-if curl -s -k -H "Authorization: Bearer $TOKEN" "https://$ARGOCD_SERVER/api/v1/projects/$PROJ-project" | grep -q "$PROJ"; then
+if curl -s -k -H "Authorization: Bearer $TOKEN" "https://$ARGOCD_SERVER/api/v1/projects/$EXPECTED_PROJECT_NAME" | grep -q "$PROJ"; then
   echo "  ✓ 프로젝트 조회 성공"
 else
-  echo "  ✕ 프로젝트 조회 실패 (권한 없음)"
+  echo "  ✕ 프로젝트 조회 실패 (권한 없음 또는 프로젝트명 불일치)"
 fi
 
 echo "2. 애플리케이션 목록 조회 테스트"
-if curl -s -k -H "Authorization: Bearer $TOKEN" "https://$ARGOCD_SERVER/api/v1/applications?project=$PROJ-project" | grep -q "items"; then
+if curl -s -k -H "Authorization: Bearer $TOKEN" "https://$ARGOCD_SERVER/api/v1/applications?project=$EXPECTED_PROJECT_NAME" | grep -q "items"; then
   echo "  ✓ 애플리케이션 목록 조회 성공"
 else
-  echo "  ✕ 애플리케이션 목록 조회 실패 (권한 없음)"
+  echo "  ✕ 애플리케이션 목록 조회 실패 (권한 없음 또는 프로젝트명 불일치)"
 fi
 `
 
@@ -1707,6 +1779,12 @@ export function buildAllFiles(services, cfg = {}) {
   // 6번째 인수 proj: buildFileMap이 projRoot 기반 경로를 생성하도록 전달
   // buildFileMap(services, ns, netPolicy, ci, argoApp, proj) 시그니처와 반드시 일치
   const files = envBuildFileMap(services, ns, netPolicyYaml, ciYaml, argoAppYaml, proj)
+  files[[overlayDir, 'kustomization.yaml'].join('/')] = genOverlayKustomization(
+    services,
+    ns,
+    cloud,
+    { registry, dockerhubUser, repo: pureRepoUrl },
+  )
 
   // ── [변경] 배포 순서: AppProject → ApplicationSet → ResourceQuota ──
   // (기존 argo-app.yaml 단독 방식 → ApplicationSet 방식으로 전환)
@@ -1912,8 +1990,8 @@ resources:
 ${resources.map(r => `  - ${r}`).join('\n')}`
 }
 
-export function genOverlayKustomization(services, ns, cloud = 'kind') {
-  const imageNameOf = name => name.replace(/-svc$/, '-service-v2')
+export function genOverlayKustomization(services, ns, cloud = 'kind', imageCfg = {}) {
+  const appServices = services.filter(s => !isDbService(s))
   const hasIngress = services.some(s => {
     const t = SERVICE_TEMPLATES[s.type] || {}
     return s.expose && !t.isDB && (cloud === 'kind' || cloud === 'local')
@@ -1927,10 +2005,11 @@ kind: Kustomization
 namespace: ${ns}
 resources:
 ${services.map(s => `  - ../../services/${s.name}`).join('\n')}
-  - networkpolicy.yaml${hasIngress ? '\n  - ingress.yaml' : ''}
+  - networkpolicy.yaml${hasIngress ? '\n  - ingress.yaml' : ''}${appServices.length ? `
 images:
-${services.map(s => `  - name: ${s.name}
-    newName: ${imageNameOf(s.name)}`).join('\n')}`
+${appServices.map(s => `  - name: ${s.name}
+    newName: ${imageRepoForService(s.name, imageCfg)}
+    newTag: latest`).join('\n')}` : ''}`
 }
 
 // ── Dockerfile ────────────────────────────────────────
@@ -1982,9 +2061,11 @@ EXPOSE ${svc.port || t.port || 8080}
 CMD ["sh", "-c", "while true; do sleep 30; done"]`
 
     case 'node-backend':
+    case 'nodejs':
+    case 'node':
       return `${registryHint}FROM ${baseImage}
 WORKDIR /app
-RUN echo '{"name":"node-svc","version":"1.0.0"}' > package.json && \\
+RUN echo '{"name":"${svc.name}","version":"1.0.0"}' > package.json && \\
     printf 'const http=require("http");\\nhttp.createServer((_,r)=>{r.writeHead(200);r.end("ok")}).listen(${svc.port || t.port || 3000})\\n' > index.js
 EXPOSE ${svc.port || t.port || 3000}
 CMD ["node", "index.js"]`
