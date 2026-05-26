@@ -2,7 +2,7 @@
 # ════════════════════════════════════════════════════════════
 #  Grad-Deploy 전체 환경 시작 스크립트
 #
-#  실행: bash start-grad-deploy.sh
+#  실행: bash ~/start-grad-deploy.sh
 #
 #  자동으로 수행:
 #    1. Docker 데몬 확인 (자동 시작)
@@ -27,30 +27,13 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# ── 프로젝트 디렉토리 자동 감지 ───────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-if [ -f "$SCRIPT_DIR/package.json" ] && [ -d "$SCRIPT_DIR/server" ]; then
-  PROJECT_DIR="$SCRIPT_DIR"
-elif [ -d "/c/Users/user/OneDrive/바탕 화면/capstone" ]; then
-  PROJECT_DIR="/c/Users/user/OneDrive/바탕 화면/capstone"
-elif [ -d "/c/Users/user/OneDrive/Desktop/capstone" ]; then
-  PROJECT_DIR="/c/Users/user/OneDrive/Desktop/capstone"
-elif [ -d "/c/Users/user/Desktop/capstone" ]; then
-  PROJECT_DIR="/c/Users/user/Desktop/capstone"
-elif [ -d "/c/Users/user/Downloads/capstone-main/capstone-main" ]; then
-  PROJECT_DIR="/c/Users/user/Downloads/capstone-main/capstone-main"
-else
-  PROJECT_DIR="/c/Users/user/OneDrive/바탕 화면/capstone"
-fi
-
+PROJECT_DIR="$HOME/vscode/project"
 SERVER_DIR="$PROJECT_DIR/server"
 SESSION_NAME="graddeploy"
 
 echo ""
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${CYAN}   Grad-Deploy 환경 시작${NC}"
-echo -e "${CYAN}   프로젝트 경로: $PROJECT_DIR${NC}"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
@@ -66,32 +49,6 @@ fi
 if ! command -v tmux >/dev/null 2>&1; then
   echo -e "${YELLOW}⚠ tmux 미설치. 설치 중...${NC}"
   sudo apt update && sudo apt install -y tmux
-fi
-
-# ── WSL 환경에서 node/npm 심볼릭 링크 자동 생성 ──────────────────
-if grep -qi microsoft /proc/version 2>/dev/null; then
-  WSL_ENV=true
-else
-  WSL_ENV=false
-fi
-
-if $WSL_ENV; then
-  LOCAL_BIN="$HOME/.local/bin"
-  mkdir -p "$LOCAL_BIN"
-  export PATH="$LOCAL_BIN:$PATH"
-
-  if ! command -v node >/dev/null 2>&1 && command -v node.exe >/dev/null 2>&1; then
-    ln -sf "$(command -v node.exe)" "$LOCAL_BIN/node"
-    echo -e "${YELLOW}⚠ WSL 감지: node → node.exe 심볼릭 링크 생성${NC}"
-  fi
-  if ! command -v npm >/dev/null 2>&1 && command -v npm.cmd >/dev/null 2>&1; then
-    ln -sf "$(command -v npm.cmd)" "$LOCAL_BIN/npm"
-    echo -e "${YELLOW}⚠ WSL 감지: npm → npm.cmd 심볼릭 링크 생성${NC}"
-  fi
-  if ! command -v npx >/dev/null 2>&1 && command -v npx.cmd >/dev/null 2>&1; then
-    ln -sf "$(command -v npx.cmd)" "$LOCAL_BIN/npx"
-    echo -e "${YELLOW}⚠ WSL 감지: npx → npx.cmd 심볼릭 링크 생성${NC}"
-  fi
 fi
 
 for cmd in docker kubectl kind cloudflared node npm; do
@@ -195,8 +152,6 @@ pkill -f "cloudflared tunnel" 2>/dev/null && echo "  cloudflared 정리됨" || t
 pkill -f "kubectl port-forward.*argocd" 2>/dev/null && echo "  port-forward 정리됨" || true
 pkill -f "node.*server/index.js" 2>/dev/null && echo "  백엔드 정리됨" || true
 pkill -f "node --watch index.js" 2>/dev/null || true
-pkill -f "node\.exe.*server/index.js" 2>/dev/null || true
-pkill -f "node\.exe.*index.js" 2>/dev/null || true
 pkill -f "vite" 2>/dev/null && echo "  Vite 정리됨" || true
 sleep 2
 
@@ -222,12 +177,10 @@ tmux send-keys -t "$SESSION_NAME":pf-argocd \
 sleep 3
 
 tmux new-window -t "$SESSION_NAME" -n backend
-tmux send-keys -t "$SESSION_NAME":backend "export PATH=$HOME/.local/bin:\$PATH" C-m
 tmux send-keys -t "$SESSION_NAME":backend "cd $SERVER_DIR" C-m
 tmux send-keys -t "$SESSION_NAME":backend "npm run dev" C-m
 
 tmux new-window -t "$SESSION_NAME" -n frontend
-tmux send-keys -t "$SESSION_NAME":frontend "export PATH=$HOME/.local/bin:\$PATH" C-m
 tmux send-keys -t "$SESSION_NAME":frontend "cd $PROJECT_DIR" C-m
 tmux send-keys -t "$SESSION_NAME":frontend "npm run dev" C-m
 
@@ -270,32 +223,29 @@ echo -e "  ${YELLOW}Backend:${NC}    ${BACKEND_URL:-(URL 발급 대기 중... tm
 echo -e "  ${YELLOW}Frontend:${NC}   ${FRONTEND_URL:-(URL 발급 대기 중... tmux cf-frontend 창 확인)}"
 echo ""
 
-# ── tmux main 창에 URL + 단축키 정보 표시 ──────────────────
-tmux send-keys -t "$SESSION_NAME":main "echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '   접속 URL'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo ''" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  ArgoCD:   ${ARGOCD_URL:-(URL 발급 대기 중... bash show-urls.sh 로 재확인)}'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  Backend:  ${BACKEND_URL:-(URL 발급 대기 중... bash show-urls.sh 로 재확인)}'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  Frontend: ${FRONTEND_URL:-(URL 발급 대기 중... bash show-urls.sh 로 재확인)}'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo ''" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  ArgoCD admin 비밀번호: $ARGOCD_PASSWORD'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo ''" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '   tmux 단축키'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo ''" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  Ctrl+B → 0~6  : 창 번호로 이동'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  Ctrl+B → N    : 다음 창'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  Ctrl+B → P    : 이전 창'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  Ctrl+B → D    : 세션 분리 (백그라운드 유지)'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  Ctrl+B → [    : 스크롤 모드 (q 로 나가기)'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo ''" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  URL 재확인:  bash show-urls.sh'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  전체 종료:   bash stop-grad-deploy.sh'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo ''" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '  ✓ 모든 서비스 시작됨'" C-m
-tmux send-keys -t "$SESSION_NAME":main "echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'" C-m
+if [ -n "$FRONTEND_URL" ]; then
+  tmux send-keys -t "$SESSION_NAME":main "echo '━━━━ 접속 URL ━━━━'" C-m
+  tmux send-keys -t "$SESSION_NAME":main "echo 'ArgoCD:   ${ARGOCD_URL:-(확인 중)}'" C-m
+  tmux send-keys -t "$SESSION_NAME":main "echo 'Backend:  ${BACKEND_URL:-(확인 중)}'" C-m
+  tmux send-keys -t "$SESSION_NAME":main "echo 'Frontend: ${FRONTEND_URL:-(확인 중)}'" C-m
+  tmux send-keys -t "$SESSION_NAME":main "echo ''" C-m
+fi
+
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}✓ 모든 서비스 시작됨${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo "tmux 세션 접속:"
+echo "  tmux attach -t $SESSION_NAME"
+echo ""
+echo "tmux 단축키:"
+echo "  Ctrl+B → 0~6  : 창 번호로 이동"
+echo "  Ctrl+B → N    : 다음 창"
+echo "  Ctrl+B → P    : 이전 창"
+echo "  Ctrl+B → D    : 세션 분리"
+echo ""
+echo "전체 종료:"
+echo "  bash ~/stop-grad-deploy.sh"
+echo ""
 
 exec tmux attach -t "$SESSION_NAME":main
