@@ -27,30 +27,13 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# ── 프로젝트 디렉토리 자동 감지 ───────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-if [ -f "$SCRIPT_DIR/package.json" ] && [ -d "$SCRIPT_DIR/server" ]; then
-  PROJECT_DIR="$SCRIPT_DIR"
-elif [ -d "/c/Users/user/OneDrive/바탕 화면/capstone" ]; then
-  PROJECT_DIR="/c/Users/user/OneDrive/바탕 화면/capstone"
-elif [ -d "/c/Users/user/OneDrive/Desktop/capstone" ]; then
-  PROJECT_DIR="/c/Users/user/OneDrive/Desktop/capstone"
-elif [ -d "/c/Users/user/Desktop/capstone" ]; then
-  PROJECT_DIR="/c/Users/user/Desktop/capstone"
-elif [ -d "/c/Users/user/Downloads/capstone-main/capstone-main" ]; then
-  PROJECT_DIR="/c/Users/user/Downloads/capstone-main/capstone-main"
-else
-  PROJECT_DIR="/c/Users/user/OneDrive/바탕 화면/capstone"
-fi
-
+PROJECT_DIR="$HOME/vscode/project"
 SERVER_DIR="$PROJECT_DIR/server"
 SESSION_NAME="graddeploy"
 
 echo ""
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${CYAN}   Grad-Deploy 환경 시작${NC}"
-echo -e "${CYAN}   프로젝트 경로: $PROJECT_DIR${NC}"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
@@ -62,7 +45,6 @@ if [ ! -d "$SERVER_DIR" ]; then
   echo -e "${RED}✗ 백엔드 디렉토리 없음: $SERVER_DIR${NC}"
   exit 1
 fi
-
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo -e "${YELLOW}⚠ tmux 미설치. 설치 중...${NC}"
@@ -190,13 +172,13 @@ tmux send-keys -t "$SESSION_NAME":main "echo ''" C-m
 
 tmux new-window -t "$SESSION_NAME" -n pf-argocd
 tmux send-keys -t "$SESSION_NAME":pf-argocd \
-  "kubectl port-forward svc/argocd-server -n argocd 18080:80 --address 127.0.0.1" C-m
+  "kubectl port-forward svc/argocd-server -n argocd 18080:80" C-m
 
 sleep 3
 
 tmux new-window -t "$SESSION_NAME" -n backend
 tmux send-keys -t "$SESSION_NAME":backend "cd $SERVER_DIR" C-m
-tmux send-keys -t "$SESSION_NAME":backend "npm install && npm run dev" C-m
+tmux send-keys -t "$SESSION_NAME":backend "npm run dev" C-m
 
 tmux new-window -t "$SESSION_NAME" -n frontend
 tmux send-keys -t "$SESSION_NAME":frontend "cd $PROJECT_DIR" C-m
@@ -206,19 +188,15 @@ sleep 5
 
 tmux new-window -t "$SESSION_NAME" -n cf-argocd
 tmux send-keys -t "$SESSION_NAME":cf-argocd \
-  "cloudflared tunnel --url http://127.0.0.1:18080 --http-host-header localhost:18080" C-m
+  "cloudflared tunnel --url http://localhost:18080" C-m
 
 tmux new-window -t "$SESSION_NAME" -n cf-backend
 tmux send-keys -t "$SESSION_NAME":cf-backend \
-  "cloudflared tunnel --url http://127.0.0.1:4000 --http-host-header localhost:4000" C-m
+  "cloudflared tunnel --url http://localhost:4000" C-m
 
 tmux new-window -t "$SESSION_NAME" -n cf-frontend
 tmux send-keys -t "$SESSION_NAME":cf-frontend \
-  "cloudflared tunnel --url http://127.0.0.1:5173 --http-host-header localhost:5173" C-m
-
-tmux new-window -t "$SESSION_NAME" -n cf-ingress
-tmux send-keys -t "$SESSION_NAME":cf-ingress \
-  "cloudflared tunnel --url http://127.0.0.1:80 --http-host-header localhost:80" C-m
+  "cloudflared tunnel --url http://localhost:5173" C-m
 
 echo ""
 echo "  cloudflared 터널 URL 발급 대기 (15초)..."
@@ -238,21 +216,18 @@ extract_url() {
 ARGOCD_URL=$(extract_url cf-argocd)
 BACKEND_URL=$(extract_url cf-backend)
 FRONTEND_URL=$(extract_url cf-frontend)
-INGRESS_URL=$(extract_url cf-ingress)
 
 echo ""
-echo -e "  ${YELLOW}ArgoCD:${NC}               ${ARGOCD_URL:-(URL 발급 대기 중... tmux cf-argocd 창 확인)}"
-echo -e "  ${YELLOW}Backend:${NC}              ${BACKEND_URL:-(URL 발급 대기 중... tmux cf-backend 창 확인)}"
-echo -e "  ${YELLOW}Frontend:${NC}             ${FRONTEND_URL:-(URL 발급 대기 중... tmux cf-frontend 창 확인)}"
-echo -e "  ${YELLOW}Demo App (Ingress):${NC}   ${INGRESS_URL:-(URL 발급 대기 중... tmux cf-ingress 창 확인)}"
+echo -e "  ${YELLOW}ArgoCD:${NC}     ${ARGOCD_URL:-(URL 발급 대기 중... tmux cf-argocd 창 확인)}"
+echo -e "  ${YELLOW}Backend:${NC}    ${BACKEND_URL:-(URL 발급 대기 중... tmux cf-backend 창 확인)}"
+echo -e "  ${YELLOW}Frontend:${NC}   ${FRONTEND_URL:-(URL 발급 대기 중... tmux cf-frontend 창 확인)}"
 echo ""
 
 if [ -n "$FRONTEND_URL" ]; then
   tmux send-keys -t "$SESSION_NAME":main "echo '━━━━ 접속 URL ━━━━'" C-m
-  tmux send-keys -t "$SESSION_NAME":main "echo 'ArgoCD:             ${ARGOCD_URL:-(확인 중)}'" C-m
-  tmux send-keys -t "$SESSION_NAME":main "echo 'Backend:            ${BACKEND_URL:-(확인 중)}'" C-m
-  tmux send-keys -t "$SESSION_NAME":main "echo 'Frontend:           ${FRONTEND_URL:-(확인 중)}'" C-m
-  tmux send-keys -t "$SESSION_NAME":main "echo 'Demo App (Ingress): ${INGRESS_URL:-(확인 중)}'" C-m
+  tmux send-keys -t "$SESSION_NAME":main "echo 'ArgoCD:   ${ARGOCD_URL:-(확인 중)}'" C-m
+  tmux send-keys -t "$SESSION_NAME":main "echo 'Backend:  ${BACKEND_URL:-(확인 중)}'" C-m
+  tmux send-keys -t "$SESSION_NAME":main "echo 'Frontend: ${FRONTEND_URL:-(확인 중)}'" C-m
   tmux send-keys -t "$SESSION_NAME":main "echo ''" C-m
 fi
 
