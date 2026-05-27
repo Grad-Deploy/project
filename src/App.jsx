@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useStore } from './hooks/useStore_improved'
 import { SERVICE_TEMPLATES } from './engines/guardrail'
-import { buildManifestYAML, genNetworkPolicies, genGitHubActions, genArgoCDApp, genArgoCDAdminConfig } from './generators/k8s_improved'
+import { buildManifestYAML, genNetworkPolicies, genGitHubActions, genArgoCDApp } from './generators/k8s_improved'
 import ServiceCard from './components/ServiceCard_integrated'
 import GuardrailPanel from './components/GuardrailPanel'
 import DeployPanel from './components/DeployPanel'
@@ -20,10 +20,9 @@ const LEFT_TABS = [
 ]
 
 const PREVIEW_TABS = [
-  { key: 'manifest', label: 'manifest.yaml',  icon: '⬡' },
-  { key: 'ci',       label: 'ci.yml',          icon: '▷' },
-  { key: 'argo',     label: 'argo-app.yaml',   icon: '◈' },
-  { key: 'sso',      label: 'argocd-cm.yaml',  icon: '◉' },  // SSO 설정 실시간 미리보기
+  { key: 'manifest', label: 'manifest.yaml', icon: '⬡' },
+  { key: 'ci', label: 'ci.yml', icon: '▷' },
+  { key: 'argo', label: 'argo-app.yaml', icon: '◈' },
 ]
 
 const CLOUD_OPTIONS = [
@@ -34,7 +33,7 @@ const CLOUD_OPTIONS = [
 ]
 
 export default function App() {
-  const { state, engineResult, propagatedServices, envIssues, resourceWarnings, set, addSvc, delSvc, updSvc, toggleSvc } = useStore()
+  const { state, engineResult, propagatedServices, envIssues, set, addSvc, delSvc, updSvc, toggleSvc } = useStore()
   const [copied, setCopied] = useState(false)
 
   const yamlContent = useMemo(() => {
@@ -45,36 +44,10 @@ export default function App() {
       ns: state.ns,
       registry: state.registry,
       dockerhubUser: state.dockerhubUser,
-      cloud: state.cloud,   // kind/local → 로컬 레지스트리 분기, kind-config.yaml 경로 등에 사용
     })
-    const argo = genArgoCDApp({
-      proj: state.proj,
-      // 미입력 상태에서도 의미 있는 플레이스홀더를 YAML 미리보기에 표시
-      repo: state.repo || 'https://github.com/YOUR_ORG/YOUR_REPO',
-      ns: state.ns,
-    })
-    // SSO 설정 탭에서 입력한 값을 반영한 argocd-cm 미리보기
-    // SsoSetupSection에서 set()으로 저장한 state 값을 그대로 사용
-    const adminConfig = genArgoCDAdminConfig({
-      proj:          state.proj,
-      ns:            state.ns,
-      githubClientId: state.ssoClientId  || 'REPLACE_WITH_OAUTH_CLIENT_ID',
-      argocdServer:  state.argocdServer  || 'argocd.example.com',
-      ssoTeams:      state.ssoTeams      || [],
-    })
-    return {
-      manifest: [manifest, np].join('\n---\n'),
-      ci,
-      argo,
-      // argocd-cm / argocd-rbac-cm 을 합쳐서 미리보기 (실제 파일은 분리 저장됨)
-      sso: [adminConfig.cm, adminConfig.rbac].join('\n---\n'),
-    }
-  }, [
-    state.services, state.ns, state.proj, state.repo, state.cloud,
-    state.registry, state.dockerhubUser,
-    // SSO 관련 의존성 — 입력할 때마다 미리보기 실시간 갱신
-    state.ssoClientId, state.argocdServer, state.ssoTeams,
-  ])
+    const argo = genArgoCDApp({ proj: state.proj, repo: state.repo, ns: state.ns })
+    return { manifest: [manifest, np].join('\n---\n'), ci, argo }
+  }, [state.services, state.ns, state.proj, state.repo, state.cloud, state.registry, state.dockerhubUser])
 
   const preview = yamlContent[state.previewFile] || ''
   const lineCount = preview.split('\n').length
@@ -272,7 +245,6 @@ export default function App() {
                     svc={svc} allServices={propagatedServices}
                     nginxCount={state.services.filter(s => s.type === 'nginx' || s.type === 'react-nginx').length}
                     others={state.services.map(s => s.name).filter(n => n !== svc.name)}
-                    resourceWarnings={resourceWarnings}
                     issues={[
                       // guardrail 엔진 이슈 (severity: 'ERROR'/'WARNING', 대문자)
                       ...engineResult.issues.filter(i => i.message.includes(`[${svc.name}]`)),

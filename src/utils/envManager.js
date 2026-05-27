@@ -11,15 +11,6 @@
 //      MVP 보안: .gitignore + secrets.example.yaml (NF-13) 로 충족
 // ══════════════════════════════════════════════════════
 
-// ── 공통 경로 헬퍼 ─────────────────────────────────────
-export function getServicePath(proj, svcName) {
-  return ['k8s', 'projects', proj, 'services', svcName].join('/')
-}
-
-export function getOverlayPath(proj) {
-  return ['k8s', 'projects', proj, 'overlays', 'production'].join('/')
-}
-
 // ── 민감 키워드 패턴 (Secret 분류 기준) ───────────────
 // PDF §9.1 명세:
 //   1순위: 변수 카탈로그의 sensitive 플래그 (현재 ENV_SPEC의 category 필드)
@@ -183,9 +174,9 @@ export const ENV_SPEC = {
   },
   elasticsearch: {
     provides: {
-      ELASTIC_PASSWORD: { category: 'secret', hint: 'elastic 슈퍼유저 비밀번호' },
-      ES_JAVA_OPTS: { category: 'configmap', hint: 'JVM 힙 설정 (예: -Xms512m -Xmx512m)' },
-      'discovery.type': { category: 'configmap', hint: '단일 노드 설정 값: single-node' },
+      ELASTIC_PASSWORD:  { category: 'secret',    hint: 'elastic 슈퍼유저 비밀번호' },
+      ES_JAVA_OPTS:      { category: 'configmap', hint: 'JVM 힙 설정 (예: -Xms512m -Xmx512m)' },
+      'discovery.type':  { category: 'configmap', hint: '단일 노드 설정 값: single-node' },
     },
     host: (svcName) => svcName,
     port: 9200,
@@ -713,7 +704,7 @@ export function genConfigMapFile(svc, ns) {
   // NEXT_PUBLIC_ 변수가 있으면 ConfigMap에 안내 주석 추가
   const buildTimeComment = buildTimeEntries.length > 0
     ? `\n  # ── 빌드 시점 변수 (Docker ARG로 주입, ConfigMap에 미포함) ──\n`
-    + buildTimeEntries.map(([k]) => `  # ${k} \u2192 Docker build --build-arg ${k}=...`).join('\n')
+      + buildTimeEntries.map(([k]) => `  # ${k} \u2192 Docker build --build-arg ${k}=...`).join('\n')
     : ''
   return `apiVersion: v1
 kind: ConfigMap
@@ -757,86 +748,62 @@ ${secretEntries.map(([k]) => `  ${k}: "\${{ secrets.${k.toUpperCase()} }}"`).joi
  * 전체 서비스에 대한 파일 목록을 생성
  * { 경로: 내용 } 형태로 반환 → DeployPanel의 ghPushFiles에 전달
  *
- * @param {Array}  services
+ * @param {Array} services
  * @param {string} ns
- * @param {string} netPolicyYaml  - genNetworkPolicies()의 결과
- * @param {string} ciYaml         - genGitHubActions()의 결과
- * @param {string} argoYaml       - genArgoCDApp()의 결과
- * @param {string} [proj='my-app'] - 프로젝트명 (buildAllFiles의 proj와 반드시 동일)
- *
- * 경로 규칙 (buildAllFiles와 일치):
- *   서비스 매니페스트: k8s/projects/<proj>/services/<svc>/
- *   overlay:          k8s/projects/<proj>/overlays/production/
- *   ArgoCD app:       k8s/projects/<proj>/argo-app.yaml
- *
- * kustomization 상대경로 (overlays/production/ 기준):
- *   ../../services/<svc>  (services/ 폴더가 overlays/production/ 과 같은 레벨에 있음)
+ * @param {string} netPolicyYaml - genNetworkPolicies()의 결과
+ * @param {string} ciYaml        - genGitHubActions()의 결과
+ * @param {string} argoYaml      - genArgoCDApp()의 결과
+ * @returns {Record<string, string>}
  */
-export function buildFileMap(services, ns, netPolicyYaml, ciYaml, argoYaml, proj = 'my-app') {
+export function buildFileMap(services, ns, netPolicyYaml, ciYaml, argoYaml) {
   const files = {}
 
-  // ── 경로 루트 계산 (buildAllFiles의 projRoot/svcRoot/overlayDir 와 동일하게 유지)
-  const projRoot = ['k8s', 'projects', proj].join('/')
-  const overlayDir = getOverlayPath(proj)
-
-  // ── 서비스별 파일 ──────────────────────────────────────
+  // 서비스별 파일
   services.forEach(svc => {
-    // [변경] 경로 헬퍼 함수를 사용하여 경로 불일치 원천 차단
-    const base = getServicePath(proj, svc.name)
+    const base = `k8s/base/${svc.name}`
 
     // ConfigMap (항상 push)
-    files[[base, 'configmap.yaml'].join('/')] = genConfigMapFile(svc, ns)
+    files[`${base}/configmap.yaml`] = genConfigMapFile(svc, ns)
 
     // Secret: GitHub Actions Secrets 참조 방식 (.gitignore 보호)
     // ⚠️ Sealed Secrets는 Phase 2 — MVP는 .gitignore + secrets.example.yaml (NF-13)
     const secretYaml = genSecretFile(svc, ns)
     if (secretYaml) {
-      files[[base, 'secret.example.yaml'].join('/')] = secretYaml
+      files[`${base}/secret.example.yaml`] = secretYaml
     }
 
-    // kustomization.yaml (서비스 폴더 내 base kustomization)
-    // nginx/react-nginx 타입은 nginx-conf.yaml도 포함
+    // kustomization.yaml
     const hasSecret = Object.keys(svc.env || {}).some(k => isSensitiveKey(k))
-    const isNginxType = (svc.type === 'nginx' || svc.type === 'react-nginx')
     const resources = ['deployment.yaml', 'service.yaml', 'configmap.yaml']
-    if (isNginxType) resources.push('nginx-conf.yaml')
     if (hasSecret) resources.push('secret.yaml')
-    files[[base, 'kustomization.yaml'].join('/')] = `apiVersion: kustomize.config.k8s.io/v1beta1
+    files[`${base}/kustomization.yaml`] = `apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
 ${resources.map(r => `  - ${r}`).join('\n')}`
   })
 
-  // ── overlay: networkpolicy ────────────────────────────
-  // [변경] 구 경로 k8s/overlays/production/ → 신 경로 overlayDir
-  files[[overlayDir, 'networkpolicy.yaml'].join('/')] = netPolicyYaml
+  // 네트워크 정책
+  files['k8s/overlays/production/networkpolicy.yaml'] = netPolicyYaml
 
-  // ── overlay: kustomization.yaml ───────────────────────
-  // 상대경로 계산:
-  //   이 파일 위치 = k8s/projects/<proj>/overlays/production/kustomization.yaml
-  //   서비스 위치  = k8s/projects/<proj>/services/<svc>/
-  //   overlays/production/ → ../../services/<svc>
-  // [변경] 구 경로 ../../base/<svc> → 신 경로 ../../services/<svc>
+  // overlays/production/kustomization.yaml
   const imageNameOf = name => name.replace(/-svc$/, '-service-v2')
-  files[[overlayDir, 'kustomization.yaml'].join('/')] = `apiVersion: kustomize.config.k8s.io/v1beta1
+  files['k8s/overlays/production/kustomization.yaml'] = `apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: ${ns}
 resources:
-${services.map(s => `  - ../../services/${s.name}`).join('\n')}
+${services.map(s => `  - ../../base/${s.name}`).join('\n')}
   - networkpolicy.yaml
 images:
 ${services.map(s => `  - name: ${s.name}
     newName: ${imageNameOf(s.name)}`).join('\n')}`
 
-  // ── CI 파이프라인 파일 (.github/workflows) ──────────────
-  files[['.github', 'workflows', 'ci-cd.yaml'].join('/')] = ciYaml
+  // CI 워크플로우
+  files['.github/workflows/ci.yml'] = ciYaml
 
-  // ── ArgoCD Application (레거시 참조용)  ───────────────
-  // [변경] 구 경로 k8s/argo-app.yaml → 신 경로 projRoot/argo-app.yaml
-  // buildAllFiles도 같은 경로에 덮어쓰므로 내용은 동일
-  files[[projRoot, 'argo-app.yaml'].join('/')] = argoYaml
+  // ArgoCD Application
+  files['k8s/argo-app.yaml'] = argoYaml
 
-  // ── .gitignore (Secret 보호) ──────────────────────────
+  // .gitignore (Secret 보호)
   files['.gitignore'] = generateGitignore()
 
   return files

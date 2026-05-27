@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react'
-import { categorizeEnvVar, ENV_SPEC, validateEnvVars } from '../utils/envManager'
+import { categorizeEnvVar, ENV_SPEC, validateEnvVars, calcResourceWarnings } from '../utils/envManager'
 
 // ── 카테고리 뱃지 ───────────────────────────────────────
 function CategoryBadge({ category }) {
@@ -400,28 +400,21 @@ export default function EnvEditor({ svc, env = {}, onChange, allServices = [] })
         border: '1px solid var(--border)',
       }}>
         💡 <strong style={{ color: 'var(--t2)' }}>자동 분류:</strong>{' '}
-        키 이름에{' '}
-        <code style={{ color: 'var(--amber)' }}>password / secret / token / auth / credential / jwt / api_key / private_key</code>가
-        포함되면 자동으로{' '}
-        <span style={{ color: 'var(--red)' }}>Secret</span>으로 분류됩니다.
-        나머지는 <span style={{ color: 'var(--blue)' }}>ConfigMap</span>으로 처리됩니다.{' '}
-        <span style={{ color: 'var(--t3)' }}>
-          (단, <code>KEY</code> 단독은 Secret이 아닙니다 — <code>PUBLIC_KEY</code>, <code>CACHE_KEY</code> 오분류 방지)
-        </span>
+        키 이름에 <code style={{ color: 'var(--amber)' }}>password / secret / token / key</code>가
+        포함되면 자동으로 <span style={{ color: 'var(--red)' }}>Secret</span>으로 분류됩니다.
+        나머지는 <span style={{ color: 'var(--blue)' }}>ConfigMap</span>으로 처리됩니다.
       </div>
     </div>
   )
 }
 
 // ── 리소스 경고 배너 ────────────────────────────────────
-// ── 리소스 경고 배너 ────────────────────────────────────
-// useStore의 resourceWarnings 계산 결과를 props로 받아 렌더.
-// (이전에는 services를 받아 calcResourceWarnings를 직접 호출했으나
-//  useStore에서 이미 memoized로 계산하므로 이중 계산 방지를 위해 변경)
-//
-// 사용 예:
-//   <ResourceWarningBanner warnings={resourceWarnings.warnings} totalRamMi={resourceWarnings.totalRamMi} />
-export function ResourceWarningBanner({ warnings = [], totalRamMi = 0 }) {
+export function ResourceWarningBanner({ services }) {
+  const { totalRamMi, warnings } = useMemo(
+    () => calcResourceWarnings(services),
+    [services]
+  )
+
   if (warnings.length === 0) return null
 
   return (

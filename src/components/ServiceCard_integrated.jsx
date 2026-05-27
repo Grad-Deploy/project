@@ -169,7 +169,7 @@ function Group({ label, children }) {
 //   others         - 다른 서비스명 배열 (deps 선택용)
 //   allServices    - ⚠️ 반드시 propagatedServices를 전달해야 함
 //   nginxCount     - 현재 nginx/react-nginx 서비스 총 수 (삭제 보호용)
-export default function ServiceCard({ svc, issues, upd, del, open, onToggle, others, allServices = [], nginxCount = 1, resourceWarnings = null }) {
+export default function ServiceCard({ svc, issues, upd, del, open, onToggle, others, allServices = [], nginxCount = 1 }) {
   const t = SERVICE_TEMPLATES[svc.type] || {}
   const issueCount = issues.length
   // guardrail 이슈: severity='ERROR'(대문자), envIssues: severity='error'(소문자) 모두 처리
@@ -263,22 +263,11 @@ export default function ServiceCard({ svc, issues, upd, del, open, onToggle, oth
           display: 'flex', flexDirection: 'column', gap: 16,
         }}>
 
-          {/* 리소스 경고 배너 — useStore의 resourceWarnings를 App.jsx에서 전달받아 렌더
-              (EnvEditor 내부에서 직접 계산하던 방식 → 이중 계산 제거) */}
-          {resourceWarnings && resourceWarnings.warnings?.length > 0 && (
-            <ResourceWarningBanner
-              warnings={resourceWarnings.warnings}
-              totalRamMi={resourceWarnings.totalRamMi}
-            />
-          )}
-
           {/* 서비스명 + 유형 */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             <Input label="서비스명" value={svc.name} onChange={v => upd({ name: v })} placeholder="svc-name" />
             <Select label="유형" value={svc.type} onChange={v => {
               const t2 = SERVICE_TEMPLATES[v] || {}
-              const isFrontend2 = v === 'nginx' || v === 'react-nginx' || v === 'nextjs'
-              const isDB2 = !!t2.isDB
               upd({
                 type: v,
                 cpuReq: t2.cpuReq, memReq: t2.memReq,
@@ -286,14 +275,6 @@ export default function ServiceCard({ svc, issues, upd, del, open, onToggle, oth
                 liveness: t2.liveness || '', readiness: t2.readiness || '',
                 port: t2.port || 8080, startupProbe: t2.isJVM || false,
                 image: '',
-                // 프론트엔드로 변경 시 expose/ingressPath 자동 설정
-                // DB/백엔드로 변경 시 expose 해제 (외부 노출 부적절)
-                expose: isFrontend2,
-                ingressPath: isFrontend2 ? '/' : '',
-                // DB는 HPA/AntiAffinity 불필요
-                hpa: isDB2 ? false : svc.hpa,
-                // 의존성은 타입 변경 시 초기화 (연결 규칙이 바뀌므로)
-                deps: [],
               })
             }} options={TYPE_OPTIONS} />
           </div>
@@ -334,11 +315,9 @@ export default function ServiceCard({ svc, issues, upd, del, open, onToggle, oth
                   background: 'rgba(0,0,0,0.3)',
                   fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--green)',
                 }}>
-                  {svc.type === 'mysql'         && 'mysqladmin ping -h localhost'}
-                  {svc.type === 'postgresql'    && 'pg_isready -U postgres'}
-                  {svc.type === 'redis'         && 'redis-cli ping'}
-                  {svc.type === 'mongodb'       && "mongosh --eval \"db.adminCommand('ping')\" --quiet"}
-                  {svc.type === 'elasticsearch' && 'curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow'}
+                  {svc.type === 'mysql'   && 'mysqladmin ping -h localhost'}
+                  {svc.type === 'redis'   && 'redis-cli ping'}
+                  {svc.type === 'mongodb' && "mongosh --eval \"db.adminCommand('ping')\" --quiet"}
                 </div>
               </div>
             ) : (

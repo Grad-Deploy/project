@@ -20,17 +20,17 @@ export function newService(type = 'spring-boot') {
   // nginx/react-nginx: 외부 트래픽 진입점이므로 expose 기본값 true
   // 이름도 타입별로 명확하게 지정
   const nameMap = {
-    'nginx': 'nginx-svc',
-    'react-nginx': 'react-nginx-svc',
-    'nextjs': 'nextjs-svc',
-    'spring-boot': 'spring-svc',
-    'node-backend': 'node-svc',
-    'python-flask': 'flask-svc',
-    'mysql': 'mysql-svc',
-    'postgresql': 'postgres-svc',
-    'redis': 'redis-svc',
-    'mongodb': 'mongo-svc',
-    'elasticsearch': 'elastic-svc',
+    'nginx':          'nginx-svc',
+    'react-nginx':    'react-nginx-svc',
+    'nextjs':         'nextjs-svc',
+    'spring-boot':    'spring-svc',
+    'node-backend':   'node-svc',
+    'python-flask':   'flask-svc',
+    'mysql':          'mysql-svc',
+    'postgresql':     'postgres-svc',
+    'redis':          'redis-svc',
+    'mongodb':        'mongo-svc',
+    'elasticsearch':  'elastic-svc',
   }
   const defaultName = nameMap[type] || `${type.split('-')[0]}-svc`
   const isNginxType = type === 'nginx' || type === 'react-nginx'
@@ -97,19 +97,7 @@ const INIT = {
   tab: 'services',
   previewFile: 'manifest',
   expandedSvcIds: {},
-
-  // SSO / Argo CD 연동 (역할2 — SsoSetupSection 에서 set()으로 저장)
-  argocdServer: import.meta.env.VITE_DEFAULT_ARGOCD_SERVER || '',   // Argo CD 서버 URL — Tab A/B 공유
-  ssoClientId: '',   // OAuth App Client ID (GitHub Variable 으로 등록됨)
-  ssoTeams: [],   // [{ team: string, role: 'admin'|'deploy'|'readonly' }]
-
-  // ── ArgoCD 자동 연동 (DeployPanel 4단계) ──────────────
-  // 세션 메모리에만 보관되며 새로고침 시 사라짐, GitHub에 push 되지 않음
-  argocdUser: import.meta.env.VITE_DEFAULT_ARGOCD_USER || 'admin',  // ArgoCD 로그인 계정 (기본 admin)
-  argocdAdminPassword: import.meta.env.VITE_DEFAULT_ARGOCD_PASSWORD || '',       // admin 비밀번호 — argoLogin()으로 토큰 발급에 사용
-  argocdToken: import.meta.env.VITE_DEFAULT_ARGOCD_TOKEN || '',       // 직접 토큰 입력 시 우선 사용 (선택)
 }
-
 
 function reducer(s, a) {
   switch (a.type) {
