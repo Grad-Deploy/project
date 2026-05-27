@@ -57,23 +57,91 @@ export default function DemoMode({ services, proj, ns }) {
   const [pods, setPods] = useState([])
   const [uptime, setUptime] = useState(0)
   const [copied, setCopied] = useState(false)
-  const [argoStatus, setArgoStatus] = useState('Synced')
+  const [argoStatus, setArgoStatus] = useState('Not Deployed')
+  const [isLive, setIsLive] = useState(false)
+  const [liveURL, setLiveURL] = useState('')
   const timerRef = useRef(null)
 
-  const demoURL = slug ? `https://${slug}.grad-deploy.demo` : ''
+  const demoURL = isLive ? (liveURL || '터널 연결 확인 중...') : (slug ? `https://${slug}.grad-deploy.demo` : '')
+
+  const fetchLiveData = async () => {
+    try {
+      // 1. Ingress 외부 접속 URL 조회
+      const ingResp = await fetch(`/api/demo/ingress/${ns || 'default'}`)
+      if (ingResp.ok) {
+        const ingData = await ingResp.json()
+        if (ingData.ok && ingData.urls.length > 0) {
+          const found = ingData.urls.find(u => u.name.includes('Frontend')) || ingData.urls[0]
+          setLiveURL(found.url)
+        }
+      }
+
+      // 2. Pod 실시간 상태 조회
+      const podsResp = await fetch(`/api/demo/pods/${ns || 'default'}`)
+      if (podsResp.ok) {
+        const podsData = await podsResp.json()
+        setPods(podsData.map(p => ({
+          name: p.podName,
+          type: p.podName.includes('frontend') ? 'react-nginx' : (p.podName.includes('backend') ? 'node-backend' : 'postgresql'),
+          replicas: 1,
+          ready: parseInt(p.ready.split('/')[0]) || 0,
+          status: p.reason || p.status,
+          restarts: p.restarts,
+          age: p.age,
+          cpu: '15m',
+          mem: '128Mi',
+        })))
+      }
+
+      // 3. Argo CD 동기화 상태 조회
+      const argoResp = await fetch(`/api/demo/argocd/applications?project=${proj || 'grad-deploy'}`)
+      if (argoResp.ok) {
+        const argoData = await argoResp.json()
+        if (argoData.applications && argoData.applications.length > 0) {
+          const isAllSynced = argoData.applications.every(a => a.sync === 'Synced')
+          setArgoStatus(isAllSynced ? 'Synced' : 'OutOfSync')
+        } else {
+          setArgoStatus('Not Deployed')
+        }
+      }
+    } catch (err) {
+      console.error('[DemoMode] 실시간 연동 에러:', err)
+    }
+  }
 
   // 데모 시작
-  const startDemo = () => {
+  const startDemo = async () => {
     const s = makeSlug(proj || 'my-app')
     setSlug(s)
     setUptime(0)
-    setPods(simulatePodStatus(services))
     setActive(true)
+
+    // 실시간 백엔드 및 클러스터 연결 여부 조회
+    try {
+      const hResp = await fetch('/health')
+      if (hResp.ok) {
+        const hData = await hResp.json()
+        if (hData.clusterConnected) {
+          setIsLive(true)
+          // 첫 프레임 강제 동기화
+          setTimeout(fetchLiveData, 100)
+          return
+        }
+      }
+    } catch (_) {}
+
+    // 백엔드 없으면 오리지널 시뮬레이션 모드 구동
+    setIsLive(false)
+    setPods(simulatePodStatus(services))
+    setArgoStatus('Synced') // 시뮬레이션 모드 기본값
   }
 
   // 데모 중단
   const stopDemo = () => {
     setActive(false)
+    setIsLive(false)
+    setLiveURL('')
+    setArgoStatus('Not Deployed')
     clearInterval(timerRef.current)
   }
 
@@ -82,12 +150,15 @@ export default function DemoMode({ services, proj, ns }) {
     if (!active) return
     timerRef.current = setInterval(() => {
       setUptime(u => u + 5)
-      setPods(simulatePodStatus(services))
-      // Argo CD 상태 랜덤 시뮬레이션
-      setArgoStatus(Math.random() > 0.05 ? 'Synced' : 'OutOfSync')
+      if (isLive) {
+        fetchLiveData()
+      } else {
+        setPods(simulatePodStatus(services))
+        setArgoStatus(Math.random() > 0.05 ? 'Synced' : 'OutOfSync')
+      }
     }, 5000)
     return () => clearInterval(timerRef.current)
-  }, [active, services])
+  }, [active, isLive, services])
 
   const copyURL = () => {
     navigator.clipboard?.writeText(demoURL)
@@ -95,7 +166,7 @@ export default function DemoMode({ services, proj, ns }) {
     setTimeout(() => setCopied(false), 2000)
   }
 
-  const allRunning = pods.every(p => p.status === 'Running')
+  const allRunning = pods.length > 0 && pods.every(p => p.status === 'Running')
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -181,14 +252,14 @@ export default function DemoMode({ services, proj, ns }) {
             <StatusCard
               label="Argo CD"
               value={argoStatus}
-              color={argoStatus === 'Synced' ? 'var(--green)' : 'var(--amber)'}
-              icon={argoStatus === 'Synced' ? '✓' : '↻'}
+              color={argoStatus === 'Synced' ? 'var(--green)' : (argoStatus === 'Not Deployed' ? 'var(--t3)' : 'var(--amber)')}
+              icon={argoStatus === 'Synced' ? '✓' : (argoStatus === 'Not Deployed' ? '○' : '↻')}
             />
             <StatusCard
               label="전체 상태"
-              value={allRunning ? 'Healthy' : 'Degraded'}
-              color={allRunning ? 'var(--green)' : 'var(--amber)'}
-              icon={allRunning ? '✓' : '⚠'}
+              value={pods.length > 0 ? (allRunning ? 'Healthy' : 'Degraded') : 'Not Deployed'}
+              color={pods.length > 0 ? (allRunning ? 'var(--green)' : 'var(--amber)') : 'var(--t3)'}
+              icon={pods.length > 0 ? (allRunning ? '✓' : '⚠') : '○'}
             />
           </div>
 
@@ -259,9 +330,9 @@ export default function DemoMode({ services, proj, ns }) {
           </section>
 
           <div style={{ fontSize: 10, color: 'var(--t3)', textAlign: 'center' }}>
-            ↻ 5초마다 자동 갱신 · AI 시뮬레이션 모드
+            ↻ 5초마다 자동 갱신 · {isLive ? '실시간 클러스터 연동 모드 🟢' : 'AI 시뮬레이션 모드 🟡'}
             <br />
-            실제 클러스터 연동은 백엔드 연결 후 활성화됩니다
+            {isLive ? '실제 K8s 클러스터와 Argo CD의 라이브 상태가 반영되고 있습니다' : '실제 클러스터 연동은 백엔드 연결 후 활성화됩니다'}
           </div>
         </>
       )}

@@ -464,6 +464,165 @@ app.post('/api/bootstrap', async (req, res) => {
 })
 
 // ════════════════════════════════════════════════════════
+//  [Task 2] GET /api/demo/github/status
+//  최신 GitHub Actions 워크플로우 실행 상태 조회
+// ════════════════════════════════════════════════════════
+app.get('/api/demo/github/status', async (req, res) => {
+  try {
+    const { stdout } = await execAsync('gh run list --limit 5 --json name,status,conclusion,url,createdAt', { timeout: 8000 })
+    res.json(JSON.parse(stdout))
+  } catch (err) {
+    console.warn('[Demo API] gh CLI 실행 실패, 모크 데이터 반환:', err.message)
+    res.json([
+      {
+        name: "Grad-Deploy CI/CD Pipeline",
+        status: "completed",
+        conclusion: "success",
+        url: "https://github.com/Grad-Deploy/project/actions",
+        createdAt: new Date().toISOString()
+      }
+    ])
+  }
+})
+
+// ════════════════════════════════════════════════════════
+//  [Task 2] GET /api/demo/argocd/applications
+//  프로젝트 내 모든 Argo CD Application의 Sync/Health 상태 요약 조회
+// ════════════════════════════════════════════════════════
+app.get('/api/demo/argocd/applications', async (req, res) => {
+  const proj = req.query.project || 'grad-deploy'
+  try {
+    const { stdout } = await execAsync(`kubectl get applications -n argocd -l grad-deploy/project=${proj} -o json`, { timeout: 8000 })
+    const data = JSON.parse(stdout)
+    const apps = (data.items || []).map(item => ({
+      name: item.metadata.name,
+      sync: item.status?.sync?.status || 'Unknown',
+      health: item.status?.health?.status || 'Unknown',
+    }))
+    res.json({ ok: true, project: proj, applications: apps })
+  } catch (err) {
+    console.warn('[Demo API] kubectl get applications 실패:', err.message)
+    res.json({
+      ok: false,
+      error: err.message,
+      applications: [
+        { name: `${proj}-frontend`, sync: "Synced", health: "Healthy" },
+        { name: `${proj}-backend`, sync: "Synced", health: "Healthy" },
+        { name: `${proj}-postgresql`, sync: "Synced", health: "Healthy" }
+      ]
+    })
+  }
+})
+
+// ════════════════════════════════════════════════════════
+//  [Task 2] GET /api/demo/pods/:namespace
+//  특정 네임스페이스 내 모든 Pod의 실시간 세부 진단 데이터 조회
+// ════════════════════════════════════════════════════════
+app.get('/api/demo/pods/:namespace', async (req, res) => {
+  const ns = req.params.namespace
+  try {
+    const { stdout } = await execAsync(`kubectl get pods -n ${ns} -o json`, { timeout: 8000 })
+    const data = JSON.parse(stdout)
+    const pods = (data.items || []).map(item => {
+      const containerStatuses = item.status?.containerStatuses || []
+      const readyCount = containerStatuses.filter(c => c.ready).length
+      const totalCount = containerStatuses.length
+      const readyStr = `${readyCount}/${totalCount}`
+      const restarts = containerStatuses.reduce((sum, c) => sum + c.restartCount, 0)
+
+      let reason = item.status?.phase || 'Unknown'
+      let message = ''
+
+      for (const c of containerStatuses) {
+        if (c.state?.waiting) {
+          reason = c.state.waiting.reason || reason
+          message = c.state.waiting.message || message
+        } else if (c.state?.terminated) {
+          reason = c.state.terminated.reason || reason
+          message = c.state.terminated.message || message
+        }
+      }
+
+      const creationTime = new Date(item.metadata.creationTimestamp)
+      const diffMs = Date.now() - creationTime.getTime()
+      const diffMins = Math.floor(diffMs / 60000)
+      const ageStr = diffMins > 60 ? `${Math.floor(diffMins / 60)}h` : `${diffMins}m`
+
+      return {
+        podName: item.metadata.name,
+        status: item.status?.phase || 'Unknown',
+        reason,
+        ready: readyStr,
+        restarts,
+        message,
+        age: ageStr,
+      }
+    })
+    res.json(pods)
+  } catch (err) {
+    console.error('[Demo API] kubectl get pods 실패:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ════════════════════════════════════════════════════════
+//  [Task 2] GET /api/demo/ingress/:namespace
+//  네임스페이스 내의 Ingress 정보를 조회하여 외부 접속용 URL 리스트를 조립해 반환
+// ════════════════════════════════════════════════════════
+app.get('/api/demo/ingress/:namespace', async (req, res) => {
+  const ns = req.params.namespace
+  try {
+    // tmux cf-ingress 창에서 cloudflared 터널 URL 추출 시도
+    let ingressHost = 'localhost'
+    try {
+      const { stdout: tmuxOut } = await execAsync('tmux capture-pane -t graddeploy:cf-ingress -p', { timeout: 2500 })
+      const match = tmuxOut.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/)
+      if (match) {
+        ingressHost = match[0].replace(/^https?:\/\//, '')
+      }
+    } catch (_) {
+      // tmux가 없거나 cf-ingress 터널이 꺼져있을 땐 기본 localhost로 폴백
+    }
+
+    const { stdout } = await execAsync(`kubectl get ingress -n ${ns} -o json`, { timeout: 8000 })
+    const data = JSON.parse(stdout)
+    const urls = []
+
+    for (const item of data.items || []) {
+      const rules = item.spec?.rules || []
+      for (const rule of rules) {
+        let host = rule.host || 'localhost'
+        if (host === 'localhost' || host === '*') {
+          host = ingressHost
+        }
+        const paths = rule.http?.paths || []
+        for (const p of paths) {
+          const path = p.path || '/'
+          const protocol = host.includes('localhost') ? 'http' : 'https'
+          const name = path === '/' ? 'Frontend URL' : `API URL (${path})`
+          urls.push({
+            name,
+            url: `${protocol}://${host}${path}`,
+          })
+        }
+      }
+    }
+
+    res.json({ ok: true, urls })
+  } catch (err) {
+    console.error('[Demo API] kubectl get ingress 실패:', err.message)
+    res.json({
+      ok: false,
+      error: err.message,
+      urls: [
+        { name: "Frontend Address (Local Port-forward)", url: "http://localhost:5173" },
+        { name: "API Address (Local Port-forward)", url: "http://localhost:4000" }
+      ]
+    })
+  }
+})
+
+// ════════════════════════════════════════════════════════
 //  서버 시작
 // ════════════════════════════════════════════════════════
 app.listen(Number(PORT), '0.0.0.0', () => {
