@@ -97,10 +97,6 @@ const INIT = {
   tab: 'services',
   previewFile: 'manifest',
   expandedSvcIds: {},
-  
-  // Cluster Advisor State
-  caAvailableCPU: null,
-  caAvailableMem: null,
 
   // SSO / Argo CD 연동 (역할2 — SsoSetupSection 에서 set()으로 저장)
   argocdServer: import.meta.env.VITE_DEFAULT_ARGOCD_SERVER || '',   // Argo CD 서버 URL — Tab A/B 공유
@@ -220,13 +216,13 @@ function reducer(s, a) {
 
       return {
         ...s,
-        services: [...s.services, pgSvc, backSvc, frontSvc],
-        expandedSvcIds: { ...s.expandedSvcIds, [frontId]: true, [backId]: false, [pgId]: false },
+        services: [pgSvc, backSvc, frontSvc],
+        expandedSvcIds: { [frontId]: true, [backId]: false, [pgId]: false },
       }
     }
 
     case 'REMOVE_MINI_BOARD_PRESET': {
-      // node-backend 타입에 POSTGRES_HOST env가 있으면 Mini Board 백엔드로 식별
+      // node-backend + POSTGRES_HOST = Mini Board 백엔드로 식별
       const miniBack = s.services.find(sv => sv.type === 'node-backend' && sv.env?.POSTGRES_HOST)
       if (!miniBack) return s
 
@@ -268,14 +264,8 @@ export function useStore() {
 
   // ── 가드레일 엔진 실행 ─────────────────────────────
   const engineResult = useMemo(
-    () => runAllEngines(state.services, { 
-      netPolicy: state.netPolicy, 
-      cloud: state.cloud,
-      availableCPU: state.caAvailableCPU,
-      availableMem: state.caAvailableMem,
-      registry: state.registry,
-    }),
-    [state.services, state.netPolicy, state.cloud, state.caAvailableCPU, state.caAvailableMem, state.registry]
+    () => runAllEngines(state.services, { netPolicy: state.netPolicy, cloud: state.cloud }),
+    [state.services, state.netPolicy, state.cloud]
   )
 
   // ── 환경변수 전파 (의존성 기반) ──────────────────────
@@ -299,20 +289,20 @@ export function useStore() {
   )
 
   // ── 디스패처 ──────────────────────────────────────
-  const set = useCallback(patch => dispatch({ type: 'SET', patch }), [])
-  const addSvc = useCallback(svcType => dispatch({ type: 'ADD_SVC', svcType }), [])
+  const set            = useCallback(patch       => dispatch({ type: 'SET',                    patch }),   [])
+  const addSvc         = useCallback(svcType     => dispatch({ type: 'ADD_SVC',                svcType }), [])
   const addMiniBoard   = useCallback(()          => dispatch({ type: 'ADD_MINI_BOARD_PRESET' }),            [])
   const removeMiniBoard = useCallback(()         => dispatch({ type: 'REMOVE_MINI_BOARD_PRESET' }),         [])
-  const delSvc = useCallback(id => dispatch({ type: 'DEL_SVC', id }), [])
-  const updSvc = useCallback((id, patch) => dispatch({ type: 'UPD_SVC', id, patch }), [])
-  const toggleSvc = useCallback(id => dispatch({ type: 'TOGGLE_SVC', id }), [])
+  const delSvc         = useCallback(id          => dispatch({ type: 'DEL_SVC',                id }),       [])
+  const updSvc         = useCallback((id, patch) => dispatch({ type: 'UPD_SVC',                id, patch }),[])
+  const toggleSvc      = useCallback(id          => dispatch({ type: 'TOGGLE_SVC',             id }),       [])
 
   return {
     state,
     engineResult,
-    propagatedServices,  // ← 새로 추가: env가 전파된 서비스
-    envIssues,           // ← 새로 추가: 환경변수 검증 결과
-    resourceWarnings,    // ← 새로 추가: 리소스 경고
+    propagatedServices,
+    envIssues,
+    resourceWarnings,
     set,
     addSvc,
     addMiniBoard,

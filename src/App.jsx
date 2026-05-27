@@ -6,7 +6,6 @@ import ServiceCard from './components/ServiceCard_integrated'
 import GuardrailPanel from './components/GuardrailPanel'
 import DeployPanel from './components/DeployPanel'
 import NetworkTopology from './components/NetworkTopology'
-import ClusterAdvisorPanel from './components/ClusterAdvisorPanel'
 import CreditPanel from './components/CreditPanel'
 import DemoMode from './components/DemoMode'
 import { Select, Toggle, YamlCode } from './components/Ui'
@@ -15,7 +14,6 @@ const LEFT_TABS = [
   { key: 'services', label: '서비스', icon: '⬡' },
   { key: 'guardrail', label: '가드레일', icon: '⊕' },
   { key: 'topology', label: '토폴로지', icon: '◈' },
-  { key: 'advisor', label: '클러스터', icon: '💻' },
   { key: 'credit', label: '크레딧', icon: '◎' },
   { key: 'demo', label: '데모데이', icon: '◉' },
   { key: 'deploy', label: '배포', icon: '▶' },
@@ -36,10 +34,10 @@ const CLOUD_OPTIONS = [
 ]
 
 export default function App() {
-  const { state, engineResult, propagatedServices, envIssues, resourceWarnings, set, addSvc, addMiniBoard, removeMiniBoard, delSvc, updSvc, toggleSvc } = useStore()
+  const { state, engineResult, propagatedServices, envIssues, resourceWarnings, set, addSvc, addMiniBoard, delSvc, updSvc, toggleSvc } = useStore()
   const [copied, setCopied] = useState(false)
 
-  const hasMiniBoard = state.services.some(s => s.type === 'node-backend' && s.env?.POSTGRES_HOST)
+  const [confirmReset, setConfirmReset] = useState(false)
 
   const yamlContent = useMemo(() => {
     const manifest = buildManifestYAML(state.services, state.ns, state.cloud)
@@ -246,56 +244,92 @@ export default function App() {
 
             {/* 서비스 탭 */}
             <div style={{ display: state.tab === 'services' ? 'flex' : 'none', flexDirection: 'column', gap: 14 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--t1)' }}>
+
+              {/* ── 1행: 서비스 레이블 + Mini Board 프리셋 ── */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--t1)', whiteSpace: 'nowrap' }}>
                   서비스
                   <span style={{ color: 'var(--t3)', fontWeight: 400, marginLeft: 7, fontSize: 12 }}>
                     ({state.services.length})
                   </span>
                 </span>
-                <div style={{ display: 'flex', gap: 5 }}>
-                  {Object.entries(SERVICE_TEMPLATES).map(([k, t]) => (
-                    <button key={k} onClick={() => addSvc(k)} title={`+ ${t.label}`}
+
+                <div style={{ flex: 1 }} />
+
+                {/* Mini Board 프리셋 — 압축형 */}
+                {confirmReset ? (
+                  /* 인라인 확인 */
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '5px 10px', borderRadius: 7,
+                    background: 'rgba(251,191,36,0.07)',
+                    border: '1px solid rgba(251,191,36,0.35)',
+                  }}>
+                    <span style={{ fontSize: 11, color: 'var(--amber)', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                      기존 서비스 전체 삭제 후 교체?
+                    </span>
+                    <button
+                      onClick={() => { addMiniBoard(); setConfirmReset(false) }}
                       style={{
-                        width: 32, height: 32, borderRadius: 7,
-                        background: `${t.color}18`, border: `1px solid ${t.color}35`,
-                        color: t.color, fontSize: 15, cursor: 'pointer',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        transition: 'all .15s',
+                        padding: '4px 10px', borderRadius: 5, fontSize: 11, fontWeight: 700,
+                        border: '1px solid rgba(248,113,113,0.5)',
+                        background: 'rgba(248,113,113,0.12)', color: 'var(--red)',
+                        cursor: 'pointer', whiteSpace: 'nowrap',
                       }}
-                      onMouseEnter={e => { e.currentTarget.style.background = `${t.color}30`; e.currentTarget.style.transform = 'scale(1.1)' }}
-                      onMouseLeave={e => { e.currentTarget.style.background = `${t.color}18`; e.currentTarget.style.transform = '' }}
-                    >{t.icon}</button>
-                  ))}
-                </div>
+                    >확인</button>
+                    <button
+                      onClick={() => setConfirmReset(false)}
+                      style={{
+                        padding: '4px 10px', borderRadius: 5, fontSize: 11, fontWeight: 600,
+                        border: '1px solid var(--border2)',
+                        background: 'transparent', color: 'var(--t2)',
+                        cursor: 'pointer', whiteSpace: 'nowrap',
+                      }}
+                    >취소</button>
+                  </div>
+                ) : (
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '5px 10px', borderRadius: 7,
+                    background: 'rgba(96,165,250,0.05)',
+                    border: '1px solid rgba(96,165,250,0.15)',
+                  }}>
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--blue)' }}>Mini Board 테스트 서비스</div>
+                      <div style={{ fontSize: 10, color: 'var(--t3)', marginTop: 1 }}>fe + be + PostgreSQL</div>
+                    </div>
+                    <button
+                      onClick={() => setConfirmReset(true)}
+                      style={{
+                        padding: '5px 11px', borderRadius: 5, fontSize: 11, fontWeight: 600,
+                        border: '1px solid rgba(96,165,250,0.45)',
+                        background: 'rgba(96,165,250,0.12)', color: 'var(--blue)',
+                        cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all .15s',
+                      }}
+                      onMouseEnter={e => { e.currentTarget.style.opacity = '0.75' }}
+                      onMouseLeave={e => { e.currentTarget.style.opacity = '1' }}
+                    >
+                      + 추가
+                    </button>
+                  </div>
+                )}
               </div>
 
-              {/* Mini Board 테스트 서비스 프리셋 */}
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 8,
-                padding: '5px 10px', borderRadius: 7,
-                background: 'rgba(96,165,250,0.05)',
-                border: '1px solid rgba(96,165,250,0.15)',
-              }}>
-                <div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--blue)' }}>Mini Board 테스트 서비스</div>
-                  <div style={{ fontSize: 10, color: 'var(--t3)', marginTop: 1 }}>fe + be + PostgreSQL</div>
-                </div>
-                <button
-                  onClick={hasMiniBoard ? removeMiniBoard : addMiniBoard}
-                  style={{
-                    padding: '5px 11px', borderRadius: 5, fontSize: 11, fontWeight: 600,
-                    border: '1px solid',
-                    borderColor: hasMiniBoard ? 'rgba(248,113,113,0.4)'  : 'rgba(96,165,250,0.45)',
-                    background:  hasMiniBoard ? 'rgba(248,113,113,0.08)' : 'rgba(96,165,250,0.12)',
-                    color:       hasMiniBoard ? 'var(--red)'              : 'var(--blue)',
-                    cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all .15s',
-                  }}
-                  onMouseEnter={e => { e.currentTarget.style.opacity = '0.75' }}
-                  onMouseLeave={e => { e.currentTarget.style.opacity = '1' }}
-                >
-                  {hasMiniBoard ? '프리셋 제거' : '프리셋 추가'}
-                </button>
+              {/* ── 2행: 서비스 타입 아이콘 버튼 ── */}
+              <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                {Object.entries(SERVICE_TEMPLATES).map(([k, t]) => (
+                  <button key={k} onClick={() => addSvc(k)} title={`+ ${t.label}`}
+                    style={{
+                      width: 32, height: 32, borderRadius: 7,
+                      background: `${t.color}18`, border: `1px solid ${t.color}35`,
+                      color: t.color, fontSize: 15, cursor: 'pointer',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      transition: 'all .15s',
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.background = `${t.color}30`; e.currentTarget.style.transform = 'scale(1.1)' }}
+                    onMouseLeave={e => { e.currentTarget.style.background = `${t.color}18`; e.currentTarget.style.transform = '' }}
+                  >{t.icon}</button>
+                ))}
               </div>
 
               {state.services.map((svc, idx) => (
@@ -346,15 +380,7 @@ export default function App() {
               </div>
             )}
 
-            {/* 클러스터 탭 */}
-            <div style={{ display: state.tab === 'advisor' ? 'block' : 'none' }}>
-              <ClusterAdvisorPanel 
-                onCapacityChange={({ availableCPU, availableMem }) => set({ caAvailableCPU: availableCPU, caAvailableMem: availableMem })}
-                onRunRA={() => set({ tab: 'guardrail' })}
-              />
-            </div>
-
-            {state.tab === 'credit' && <CreditPanel services={state.services} availableCPU={state.caAvailableCPU} availableMem={state.caAvailableMem} />}
+            {state.tab === 'credit' && <CreditPanel services={state.services} />}
             {state.tab === 'demo' && <DemoMode services={state.services} proj={state.proj} ns={state.ns} />}
             {state.tab === 'deploy' && <DeployPanel state={state} engineResult={engineResult} set={set} />}
           </div>
