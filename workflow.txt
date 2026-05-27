@@ -1,0 +1,16 @@
+선행 준비
+Argo CD 준비
+1. minikube start
+2. kubectl create namespace argocd
+3. kubectl port-forwarding svc/argocd-server -n argocd 8080:443 &
+4. ngrok http https://localhost:8080
+5. Argo CD 로그인 후 Argocd_TOKEN 발행
+6. repository git 연동
+7. application 생성 - 이 과정은 github에 push 한 이후에 진행하는 과정
+
+진행과정
+1. npm run dev를 통해 웹서비스 생성
+2. 선택한 서비스들을 GitHub push - GitHub Token 발행 후 추가
+3. 새로 생성한 repository에 argocd token과 argocd 웹 주소 추가
+4. 생성한 repo에 다시 새로운 service 추가 ( 처음 생성했을 때는 argocd token과 웹 주소가 적용되지 않아 argocd와 동기화 X)
+5. GitHub 에 push - 이제는 argocd 와 동기화 진행 ( GitHub actions를 통해 확인이 가능하고, argocd상에서도 health check와 회복하려고 함)

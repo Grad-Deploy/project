@@ -1,0 +1,81 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+:root {
+  /* 배경 — 충분히 어둡고 대비 명확 */
+  --bg0: #060810;
+  --bg1: #0b0f1c;
+  --bg2: #101828;
+  --bg3: #1a2235;
+
+  /* 테두리 — 이전보다 2배 밝게 */
+  --border:  rgba(99,179,237,0.18);
+  --border2: rgba(99,179,237,0.40);
+
+  /* 액센트 — 채도 높이고 밝기 강화 */
+  --blue:   #60a5fa;
+  --cyan:   #22d3ee;
+  --green:  #4ade80;
+  --red:    #f87171;
+  --amber:  #fbbf24;
+  --purple: #c084fc;
+
+  /* 텍스트 — 명도 차이 확실히 */
+  --t1: #f8fafc;   /* 본문 — 거의 흰색 */
+  --t2: #94a3b8;   /* 보조 — 선명한 회색 */
+  --t3: #475569;   /* 힌트 — 중간 회색 */
+  --t4: #1e293b;   /* 비활성 배경용 */
+
+  /* 폰트 */
+  --mono: 'IBM Plex Mono', 'Fira Code', monospace;
+  --sans: 'Space Grotesk', system-ui, sans-serif;
+
+  /* 라디우스 */
+  --r:  6px;
+  --r2: 10px;
+  --r3: 14px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  background: var(--bg0);
+  color: var(--t1);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* 스크롤바 — 더 눈에 띄게 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg2); }
+::-webkit-scrollbar-thumb { background: rgba(96,165,250,0.35); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(96,165,250,0.55); }
+
+::selection { background: rgba(96,165,250,0.28); color: #fff; }
+
+input, select, button, textarea {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: inherit;
+}
+
+button { cursor: pointer; border: none; background: none; }
+
+/* ── 애니메이션 ─────────────────────── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+@keyframes ripple {
+  0%   { transform: scale(1);    opacity: 0.6; }
+  100% { transform: scale(2.2);  opacity: 0; }
+}
+
+.fade-up { animation: fadeUp .22s ease both; }

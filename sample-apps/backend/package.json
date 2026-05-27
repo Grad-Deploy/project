@@ -1,0 +1,16 @@
+{
+  "name": "mini-board-backend",
+  "version": "1.0.0",
+  "description": "Mini Board Node.js backend for Grad-Deploy test service",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.0",
+    "pg": "^8.11.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
