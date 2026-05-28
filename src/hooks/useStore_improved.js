@@ -192,7 +192,7 @@ function reducer(s, a) {
       const backSvc = {
         ...newService('node-backend'),
         id: backId,
-        name: 'backend-svc',
+        name: 'node-svc',
         env: {
           POSTGRES_HOST:     'postgres-svc',
           POSTGRES_PORT:     '5432',
@@ -208,8 +208,8 @@ function reducer(s, a) {
       const frontSvc = {
         ...newService('react-nginx'),
         id: frontId,
-        name: 'frontend-svc',
-        deps: ['backend-svc'],
+        name: 'react-nginx-svc',
+        deps: ['node-svc'],
         expose: true,
         ingressPath: '/',
       }

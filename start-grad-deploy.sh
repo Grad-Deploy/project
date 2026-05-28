@@ -27,7 +27,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-PROJECT_DIR="$HOME/vscode/project"
+PROJECT_DIR="/mnt/c/Users/user/OneDrive/바탕 화면/project-fix-bugs"
 SERVER_DIR="$PROJECT_DIR/server"
 SESSION_NAME="graddeploy"
 

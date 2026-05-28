@@ -16,6 +16,7 @@ import { SERVICE_TEMPLATES } from '../engines/guardrail'
 import { buildFileMap as envBuildFileMap } from '../utils/envManager'
 import backendIndexSrc  from '../../sample-apps/backend/index.js?raw'
 import backendPkgSrc    from '../../sample-apps/backend/package.json?raw'
+import backendLockSrc   from '../../sample-apps/backend/package-lock.json?raw'
 import frontendHtmlSrc  from '../../sample-apps/frontend/index.html?raw'
 import frontendNginxSrc from '../../sample-apps/frontend/nginx.conf?raw'
 
@@ -2003,6 +2004,7 @@ echo "   rm k8s/projects/\${PROJ}/docs/bootstrap.sh"
     files[`Dockerfile.${miniBackend.name}`]   = minisBoardBackendDockerfile(miniBackend.port || 3000)
     files['sample-apps/backend/index.js']     = backendIndexSrc
     files['sample-apps/backend/package.json'] = backendPkgSrc
+    files['sample-apps/backend/package-lock.json'] = backendLockSrc
   }
 
   if (miniFrontend) {

@@ -37,7 +37,7 @@ export default function App() {
   const { state, engineResult, propagatedServices, envIssues, resourceWarnings, set, addSvc, addMiniBoard, delSvc, updSvc, toggleSvc } = useStore()
   const [copied, setCopied] = useState(false)
 
-  const [confirmReset, setConfirmReset] = useState(false)
+
 
   const yamlContent = useMemo(() => {
     const manifest = buildManifestYAML(state.services, state.ns, state.cloud)
@@ -256,63 +256,31 @@ export default function App() {
 
                 <div style={{ flex: 1 }} />
 
-                {/* Mini Board 프리셋 — 압축형 */}
-                {confirmReset ? (
-                  /* 인라인 확인 */
-                  <div style={{
-                    display: 'flex', alignItems: 'center', gap: 8,
-                    padding: '5px 10px', borderRadius: 7,
-                    background: 'rgba(251,191,36,0.07)',
-                    border: '1px solid rgba(251,191,36,0.35)',
-                  }}>
-                    <span style={{ fontSize: 11, color: 'var(--amber)', fontWeight: 600, whiteSpace: 'nowrap' }}>
-                      기존 서비스 전체 삭제 후 교체?
-                    </span>
-                    <button
-                      onClick={() => { addMiniBoard(); setConfirmReset(false) }}
-                      style={{
-                        padding: '4px 10px', borderRadius: 5, fontSize: 11, fontWeight: 700,
-                        border: '1px solid rgba(248,113,113,0.5)',
-                        background: 'rgba(248,113,113,0.12)', color: 'var(--red)',
-                        cursor: 'pointer', whiteSpace: 'nowrap',
-                      }}
-                    >확인</button>
-                    <button
-                      onClick={() => setConfirmReset(false)}
-                      style={{
-                        padding: '4px 10px', borderRadius: 5, fontSize: 11, fontWeight: 600,
-                        border: '1px solid var(--border2)',
-                        background: 'transparent', color: 'var(--t2)',
-                        cursor: 'pointer', whiteSpace: 'nowrap',
-                      }}
-                    >취소</button>
+                {/* Mini Board 프리셋 — 즉시 추가 */}
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  padding: '5px 10px', borderRadius: 7,
+                  background: 'rgba(96,165,250,0.05)',
+                  border: '1px solid rgba(96,165,250,0.15)',
+                }}>
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--blue)' }}>Mini Board 테스트 서비스</div>
+                    <div style={{ fontSize: 10, color: 'var(--t3)', marginTop: 1 }}>fe + be + PostgreSQL</div>
                   </div>
-                ) : (
-                  <div style={{
-                    display: 'flex', alignItems: 'center', gap: 8,
-                    padding: '5px 10px', borderRadius: 7,
-                    background: 'rgba(96,165,250,0.05)',
-                    border: '1px solid rgba(96,165,250,0.15)',
-                  }}>
-                    <div>
-                      <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--blue)' }}>Mini Board 테스트 서비스</div>
-                      <div style={{ fontSize: 10, color: 'var(--t3)', marginTop: 1 }}>fe + be + PostgreSQL</div>
-                    </div>
-                    <button
-                      onClick={() => setConfirmReset(true)}
-                      style={{
-                        padding: '5px 11px', borderRadius: 5, fontSize: 11, fontWeight: 600,
-                        border: '1px solid rgba(96,165,250,0.45)',
-                        background: 'rgba(96,165,250,0.12)', color: 'var(--blue)',
-                        cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all .15s',
-                      }}
-                      onMouseEnter={e => { e.currentTarget.style.opacity = '0.75' }}
-                      onMouseLeave={e => { e.currentTarget.style.opacity = '1' }}
-                    >
-                      + 추가
-                    </button>
-                  </div>
-                )}
+                  <button
+                    onClick={addMiniBoard}
+                    style={{
+                      padding: '5px 11px', borderRadius: 5, fontSize: 11, fontWeight: 600,
+                      border: '1px solid rgba(96,165,250,0.45)',
+                      background: 'rgba(96,165,250,0.12)', color: 'var(--blue)',
+                      cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all .15s',
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.opacity = '0.75' }}
+                    onMouseLeave={e => { e.currentTarget.style.opacity = '1' }}
+                  >
+                    + 추가
+                  </button>
+                </div>
               </div>
 
               {/* ── 2행: 서비스 타입 아이콘 버튼 ── */}
