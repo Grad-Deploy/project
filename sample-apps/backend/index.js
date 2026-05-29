@@ -18,6 +18,14 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'backend-svc' })
 })
 
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true, service: 'backend-svc' })
+})
+
+app.get('/ready', (_req, res) => {
+  res.json({ ok: true, service: 'backend-svc' })
+})
+
 app.get('/api/db-check', async (_req, res) => {
   try {
     await pool.query('SELECT 1')

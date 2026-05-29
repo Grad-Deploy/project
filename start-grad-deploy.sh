@@ -31,6 +31,10 @@ PROJECT_DIR="/mnt/c/Users/user/OneDrive/바탕 화면/project-fix-bugs"
 SERVER_DIR="$PROJECT_DIR/server"
 SESSION_NAME="graddeploy"
 
+# ── 인자 동적 매핑 (NS = 네임스페이스, SVC = 프론트엔드 서비스명) ──
+NS="${1:-default}"
+SVC="${2:-react-nginx-svc}"
+
 echo ""
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${CYAN}   Grad-Deploy 환경 시작${NC}"
@@ -111,6 +115,19 @@ if ! kubectl get nodes >/dev/null 2>&1; then
   exit 1
 fi
 echo -e "${GREEN}✓ kind 클러스터 정상${NC}"
+
+echo ""
+echo -e "${BLUE}[2.5/4] Sealed Secrets 컨트롤러 확인...${NC}"
+if ! kubectl get deployment sealed-secrets-controller -n kube-system >/dev/null 2>&1; then
+  echo -e "${YELLOW}⚠ Sealed Secrets 컨트롤러 미설치. 설치 중...${NC}"
+  kubectl apply -f https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.27.1/controller.yaml
+  echo "  Sealed Secrets 컨트롤러 준비 대기..."
+  kubectl wait --namespace kube-system \
+    --for=condition=available deployment/sealed-secrets-controller \
+    --timeout=120s || echo -e "${YELLOW}⚠ Sealed Secrets 준비 대기 시간 초과 (계속 진행)${NC}"
+else
+  echo -e "${GREEN}✓ Sealed Secrets 컨트롤러 정상 실행 중${NC}"
+fi
 
 echo ""
 echo -e "${BLUE}[3/4] ArgoCD 상태 확인...${NC}"
@@ -198,6 +215,8 @@ tmux new-window -t "$SESSION_NAME" -n cf-frontend
 tmux send-keys -t "$SESSION_NAME":cf-frontend \
   "cloudflared tunnel --url http://localhost:5173" C-m
 
+
+
 echo ""
 echo "  cloudflared 터널 URL 발급 대기 (15초)..."
 sleep 15
@@ -225,9 +244,9 @@ echo ""
 
 if [ -n "$FRONTEND_URL" ]; then
   tmux send-keys -t "$SESSION_NAME":main "echo '━━━━ 접속 URL ━━━━'" C-m
-  tmux send-keys -t "$SESSION_NAME":main "echo 'ArgoCD:   ${ARGOCD_URL:-(확인 중)}'" C-m
-  tmux send-keys -t "$SESSION_NAME":main "echo 'Backend:  ${BACKEND_URL:-(확인 중)}'" C-m
-  tmux send-keys -t "$SESSION_NAME":main "echo 'Frontend: ${FRONTEND_URL:-(확인 중)}'" C-m
+  tmux send-keys -t "$SESSION_NAME":main "echo 'ArgoCD:     ${ARGOCD_URL:-(확인 중)}'" C-m
+  tmux send-keys -t "$SESSION_NAME":main "echo 'Backend:    ${BACKEND_URL:-(확인 중)}'" C-m
+  tmux send-keys -t "$SESSION_NAME":main "echo 'Frontend:   ${FRONTEND_URL:-(확인 중)}'" C-m
   tmux send-keys -t "$SESSION_NAME":main "echo ''" C-m
 fi
 

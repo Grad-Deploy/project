@@ -27,10 +27,26 @@ require('dotenv').config()
 const express = require('express')
 const https   = require('https')
 const http    = require('http')
-const { exec } = require('child_process')
+const { exec, spawn } = require('child_process')
 const { promisify } = require('util')
 
 const execAsync = promisify(exec)
+
+const execWithStdin = (cmd, stdinData, options = {}) => {
+  return new Promise((resolve, reject) => {
+    const child = exec(cmd, options, (error, stdout, stderr) => {
+      if (error) {
+        reject(Object.assign(error, { stdout, stderr }));
+      } else {
+        resolve({ stdout, stderr });
+      }
+    });
+    if (stdinData !== undefined && stdinData !== null) {
+      child.stdin.write(stdinData);
+    }
+    child.stdin.end();
+  });
+};
 const app = express()
 app.use(express.json({ limit: '5mb' }))
 function toK8sName(value, fallback = 'my-app') {
@@ -628,6 +644,220 @@ app.get('/api/demo/ingress/:namespace', async (req, res) => {
         { name: "API Address (Local Port-forward)", url: "http://localhost:4000" }
       ]
     })
+  }
+})
+
+// ════════════════════════════════════════════════════════
+//  [신규] POST /api/apply-secrets
+//  Kubernetes Secret 자동 생성 및 관련 Pod 재시작 (delete)
+// ════════════════════════════════════════════════════════
+app.post('/api/apply-secrets', async (req, res) => {
+  const { namespace, secrets } = req.body
+
+  const safePattern = /^[a-zA-Z0-9_-]+$/
+  const ns = (namespace && safePattern.test(namespace)) ? namespace : 'default'
+
+  if (!Array.isArray(secrets)) {
+    return res.status(400).json({ error: 'secrets must be an array' })
+  }
+
+  const results = []
+  try {
+    // 1. 네임스페이스 생성/확인
+    await execAsync(`kubectl create namespace ${ns} --dry-run=client -o yaml | kubectl apply -f -`, { timeout: 10000 })
+
+    for (const sec of secrets) {
+      if (!sec.name || !safePattern.test(sec.name)) {
+        throw new Error(`잘못된 secret 이름 형식: ${sec.name}`)
+      }
+
+      const keys = Object.keys(sec.data || {})
+      if (keys.length === 0) continue
+
+      let stringDataYaml = ''
+      for (const k of keys) {
+        if (!/^[a-zA-Z0-9_.-]+$/.test(k)) {
+          throw new Error(`잘못된 secret 키 형식: ${k}`)
+        }
+        stringDataYaml += `  ${k}: |-\n${String(sec.data[k]).split('\n').map(line => `    ${line}`).join('\n')}\n`
+      }
+
+      const secretYaml = `apiVersion: v1
+kind: Secret
+metadata:
+  name: ${sec.name}
+  namespace: ${ns}
+type: Opaque
+stringData:
+${stringDataYaml}`
+
+      // stdin으로 안전하게 apply 실행 (셸 인젝션 원천 차단)
+      await execWithStdin(`kubectl apply -f -`, secretYaml, { timeout: 10000 })
+
+      // 2. 관련된 Pod 재시작 (새 Secret 즉시 인식 유도)
+      if (sec.svcName && safePattern.test(sec.svcName)) {
+        try {
+          await execAsync(`kubectl delete pods -n ${ns} -l app=${sec.svcName} --ignore-not-found=true`, { timeout: 10000 })
+        } catch (e) {
+          console.warn(`[apply-secrets] Pod delete failed for ${sec.svcName}:`, e.message)
+        }
+      }
+
+      results.push({ name: sec.name, ok: true })
+    }
+
+    res.json({ ok: true, secrets: results })
+  } catch (err) {
+    console.error('[apply-secrets] 실패:', err.message)
+    res.status(500).json({ ok: false, error: err.message })
+  }
+})
+
+// ════════════════════════════════════════════════════════
+//  [신규] POST /api/port-forward
+//  Kubernetes Service 로컬 포트 포워딩 백그라운드 자동 구동
+// ════════════════════════════════════════════════════════
+global.activePortForwards = global.activePortForwards || {}
+
+app.post('/api/port-forward', async (req, res) => {
+  const { serviceName, namespace, localPort, containerPort } = req.body
+
+  const safePattern = /^[a-zA-Z0-9_-]+$/
+  if (!safePattern.test(serviceName || '')) {
+    return res.status(400).json({ error: '잘못된 serviceName 형식' })
+  }
+  const ns = (namespace && safePattern.test(namespace)) ? namespace : 'default'
+  const lp = parseInt(localPort)
+  const cp = parseInt(containerPort)
+
+  if (isNaN(lp) || isNaN(cp)) {
+    return res.status(400).json({ error: 'localPort 및 containerPort는 숫자여야 합니다' })
+  }
+
+  try {
+    // 1. 기존 동일 로컬 포트의 포트 포워딩 프로세스가 있다면 클린 종료
+    if (global.activePortForwards[lp]) {
+      console.log(`[port-forward] 기존 포트 ${lp}의 포트 포워더 프로세스 종료 시도`)
+      try {
+        global.activePortForwards[lp].kill('SIGTERM')
+      } catch (err) {
+        console.warn(`[port-forward] 프로세스 종료 실패:`, err.message)
+      }
+      delete global.activePortForwards[lp]
+    }
+
+    // 2. 백그라운드에서 kubectl port-forward 스폰
+    console.log(`[port-forward] kubectl port-forward svc/${serviceName} -n ${ns} ${lp}:${cp} 백그라운드 실행`)
+    const child = spawn('kubectl', [
+      'port-forward',
+      `svc/${serviceName}`,
+      '-n',
+      ns,
+      `${lp}:${cp}`
+    ], {
+      detached: true,
+      stdio: 'ignore',
+      shell: process.platform === 'win32'
+    })
+
+    child.unref()
+
+    // 오류로 바로 즉사하는 경우 방지를 위해 약간 대기 후 상태 체크
+    await new Promise(r => setTimeout(r, 1000))
+
+    if (child.exitCode !== null) {
+      // 이미 구동 중 등의 이유로 즉시 사망한 경우
+      return res.status(500).json({
+        ok: false,
+        error: `포트 포워딩 실행 실패 (Exit Code: ${child.exitCode}). 이미 포트가 사용 중일 수 있습니다.`
+      })
+    }
+
+    // 레지스트리에 프로세스 등록
+    global.activePortForwards[lp] = child
+
+    res.json({ ok: true, message: `포트 포워딩(${lp}:${cp})이 백그라운드에서 자동 구동되었습니다.` })
+  } catch (err) {
+    console.error('[port-forward] 실패:', err.message)
+    res.status(500).json({ ok: false, error: err.message })
+  }
+})
+
+// ════════════════════════════════════════════════════════
+//  [신규] POST /api/tunnel-url
+//
+//  Argo CD API를 통해 클러스터 내 cloudflared-tunnel Pod의 로그를 조회하고,
+//  실시간으로 발급된 trycloudflare.com 외부 접속 도메인을 추출합니다.
+// ════════════════════════════════════════════════════════
+app.post('/api/tunnel-url', async (req, res) => {
+  const { proj, namespace, argoServer, argoToken } = req.body
+
+  if (!proj || !argoServer || !argoToken) {
+    return res.status(400).json({ error: '필수 매개변수(proj, argoServer, argoToken)가 누락되었습니다' })
+  }
+
+  const ns = namespace || 'default'
+  const appName = proj
+  const argoBase = argoServer.replace(/\/+$/, '')
+
+  try {
+    // 1. Argo CD에서 리소스 리스트 조회하여 cloudflared-tunnel Pod 이름 색출
+    const resourceUrl = `${argoBase}/api/v1/applications/${appName}/resource`
+    console.log(`[tunnel-url] 리소스 조회: ${resourceUrl}`)
+
+    const resourceRes = await fetch(resourceUrl, {
+      headers: {
+        'Authorization': `Bearer ${argoToken}`,
+        'Content-Type': 'application/json'
+      }
+    })
+
+    if (!resourceRes.ok) {
+      const errText = await resourceRes.text()
+      return res.status(resourceRes.status).json({ error: `Argo CD 리소스 조회 실패: ${errText}` })
+    }
+
+    const resourceData = await resourceRes.json()
+    const resources = resourceData.resources || []
+
+    const pod = resources.find(r => r.kind === 'Pod' && r.name && r.name.includes('cloudflared-tunnel'))
+    if (!pod) {
+      return res.status(404).json({ error: '클러스터에서 cloudflared-tunnel Pod를 찾을 수 없습니다. 배포(Sync) 상태를 확인하십시오.' })
+    }
+
+    const podName = pod.name
+    console.log(`[tunnel-url] 발견된 Pod: ${podName}`)
+
+    // 2. Argo CD Pod 로그 API 호출하여 tunnel 도메인 파싱
+    const logsUrl = `${argoBase}/api/v1/applications/${appName}/resource/logs?namespace=${ns}&name=${podName}&kind=Pod&container=cloudflared`
+    console.log(`[tunnel-url] 로그 조회: ${logsUrl}`)
+
+    const logsRes = await fetch(logsUrl, {
+      headers: {
+        'Authorization': `Bearer ${argoToken}`,
+        'Content-Type': 'application/json'
+      }
+    })
+
+    if (!logsRes.ok) {
+      const errText = await logsRes.text()
+      return res.status(logsRes.status).json({ error: `Argo CD 로그 조회 실패: ${errText}` })
+    }
+
+    const logBody = await logsRes.text()
+    
+    // trycloudflare.com 주소 정규표현식으로 실시간 매칭
+    const domainMatch = logBody.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/)
+    if (domainMatch) {
+      const tunnelUrl = domainMatch[0]
+      console.log(`[tunnel-url] 자동 획득한 주소: ${tunnelUrl}`)
+      return res.json({ ok: true, url: tunnelUrl })
+    }
+
+    res.status(404).json({ error: '외부 터널 도메인을 로그에서 아직 찾지 못했습니다. 터널 기동 중일 수 있으니 2초 후 재시도하십시오.' })
+  } catch (err) {
+    console.error('[tunnel-url] 실패:', err.message)
+    res.status(500).json({ error: err.message })
   }
 })
 
