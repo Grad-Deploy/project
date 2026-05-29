@@ -56,6 +56,14 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'backend-svc' })
 })
 
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true, service: 'backend-svc' })
+})
+
+app.get('/ready', (_req, res) => {
+  res.json({ ok: true, service: 'backend-svc' })
+})
+
 app.get('/api/db-check', async (_req, res) => {
   try {
     await pool.query('SELECT 1')
@@ -1303,12 +1311,16 @@ function repoOwnerFromUrl(repoUrl) {
   return match ? match[1].toLowerCase() : '${{ github.repository_owner }}'
 }
 
-function imageRepoForService(serviceName, { registry = 'ghcr', dockerhubUser = '', repo = '' } = {}) {
-  const imageName = generatedImageName(serviceName)
+function imageRepoForService(serviceName, { registry = 'ghcr', dockerhubUser = '', repo = '', ghUserLogin = '' } = {}) {
+  const imageName = serviceName.replace(/-svc$/, '-service-v2')   // CI와 동일한 규칙
   if (registry === 'dockerhub') {
     return `docker.io/${dockerhubUser || 'REPLACE_DOCKERHUB_USERNAME'}/${imageName}`
   }
-  return `ghcr.io/${repoOwnerFromUrl(repo)}/${imageName}`
+  const rawOwner = repoOwnerFromUrl(repo)
+  const owner = (rawOwner && rawOwner !== '${{ github.repository_owner }}') 
+    ? rawOwner 
+    : (ghUserLogin || '${{ github.repository_owner }}')
+  return `ghcr.io/${owner.toLowerCase()}/${imageName}`
 }
 
 // ── 클러스터 환경별 StorageClass 기본값 ──────────────
@@ -1338,13 +1350,13 @@ function httpProbeYaml(path, port, periodSeconds, failureThreshold) {
 }
 
 // ── Deployment / StatefulSet ──────────────────────────
-function genDeployment(svc, ns, cloud = 'kind') {
+function genDeployment(svc, ns, cloud = 'kind', imageCfg = {}) {
   const t = SERVICE_TEMPLATES[svc.type] || {}
   const isDB = !!t.isDB
   const kind = isDB ? 'StatefulSet' : 'Deployment'
   const port = svc.port || t.port || 8080
   const isNginxType = (svc.type === 'nginx' || svc.type === 'react-nginx')
-  const img = isDB ? (svc.image || getImageForService(svc)) : `${svc.name}:latest`
+  const img = isDB ? (svc.image || getImageForService(svc)) : `${imageRepoForService(svc.name, imageCfg)}:latest`
   const cpuR = svc.cpuReq || t.cpuReq || '100m'
   const memR = svc.memReq || t.memReq || '256Mi'
   const memL = svc.memLim || t.memLim || '512Mi'
@@ -1367,10 +1379,16 @@ function genDeployment(svc, ns, cloud = 'kind') {
     readinessProbe = httpProbeYaml(rd, port, 10, 3)
   }
 
+  // ── DB securityContext ────────────────────────────────
+  // ⚠️ [CrashLoop 수정] 기존엔 모든 DB에 runAsUser: 999 를 강제했으나,
+  //   postgres:16-alpine 의 postgres 유저는 uid 70 이라 999 로 실행하면
+  //   데이터 디렉터리(/var/lib/postgresql/data)에 쓰지 못해 initdb 가
+  //   "Permission denied" 로 exit 1 → CrashLoopBackOff 가 발생한다.
+  //   공식 postgres/mysql/mongo 이미지는 root 엔트리포인트에서 chown 후
+  //   자체적으로 비권한 유저로 강등(gosu/su-exec)하므로, runAsUser 를
+  //   강제하지 않고 이미지 기본 동작에 맡긴다.
   const securityContextBlock = isDB
-    ? `
-      securityContext:
-        runAsUser: 999`
+    ? ''
     : isNginxType
       ? ''
       : `
@@ -1394,6 +1412,28 @@ function genDeployment(svc, ns, cloud = 'kind') {
 
   // ── StorageClass: 사용자 지정 > 환경별 기본값
   const scName = svc.storageClass || STORAGE_CLASS_DEFAULT[cloud] || 'standard'
+
+  // ── DB 데이터 볼륨 마운트 ──────────────────────────────
+  // [수정] volumeClaimTemplates 의 'data' PVC 가 컨테이너에 마운트되지 않아
+  //   데이터가 영속되지 않던 문제를 해결한다. DB 타입별 데이터 디렉터리에 마운트한다.
+  const DB_DATA_PATH = {
+    postgresql:    '/var/lib/postgresql/data',
+    mysql:         '/var/lib/mysql',
+    mongodb:       '/data/db',
+    redis:         '/data',
+    elasticsearch: '/usr/share/elasticsearch/data',
+  }
+  const dbDataPath = isDB ? DB_DATA_PATH[svc.type] : null
+  const dbVolumeMount = dbDataPath ? `
+          volumeMounts:
+            - name: data
+              mountPath: ${dbDataPath}` : ''
+  // postgres 는 PGDATA 를 마운트 루트의 하위 디렉터리로 지정해야
+  // 볼륨 루트(lost+found 등)와 충돌 없이 initdb 가 동작한다.
+  const dbEnvBlock = (svc.type === 'postgresql') ? `
+          env:
+            - name: PGDATA
+              value: ${dbDataPath}/pgdata` : ''
 
   // ── nginx / react-nginx: nginx.conf ConfigMap 볼륨 마운트
   // nginx.conf는 별도 ConfigMap({svc.name}-nginx-conf)으로 관리
@@ -1425,7 +1465,9 @@ spec:
     metadata:
       labels:
         app: ${svc.name}
-    spec:${securityContextBlock}${affinityBlock}${nginxVolume}
+    spec:${isDB ? '' : `
+      imagePullSecrets:
+        - name: ghcr-secret`}${securityContextBlock}${affinityBlock}${nginxVolume}
       containers:
         - name: ${svc.name}
           image: "${img}"
@@ -1437,13 +1479,13 @@ spec:
               cpu: "${cpuR}"
               memory: "${memR}"
             limits:
-              ${cpuL ? `cpu: "${cpuL}"\n              ` : ''}memory: "${memL}"
+              ${cpuL ? `cpu: "${cpuL}"\n              ` : ''}memory: "${memL}"${dbEnvBlock}
           envFrom:
             - configMapRef:
                 name: ${svc.name}-config
             - secretRef:
                 name: ${svc.name}-secret
-                optional: true${nginxVolumeMount}
+                optional: true${nginxVolumeMount}${dbVolumeMount}
 ${startupProbe ? `          startupProbe:
             ${startupProbe}
 ` : ''}          livenessProbe:
@@ -1555,7 +1597,12 @@ export function genNginxConf(svc, services, ns) {
     }`).join('\n')
 
   // location 블록 — 백엔드 API 프록시
-  const proxyLocations = backends.map(b => `
+  const proxyLocations = backends.map(b => {
+    const dep = services.find(s => s.name === b.name)
+    const isNodeBackend = dep && dep.type === 'node-backend'
+
+    // 기본 백엔드 개별 프록시 경로
+    let locs = `
         # ${b.name} 백엔드 프록시
         location ${b.path} {
             proxy_pass http://${b.name}_upstream;
@@ -1565,7 +1612,35 @@ export function genNginxConf(svc, services, ns) {
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_read_timeout 60s;
             proxy_connect_timeout 10s;
-        }`).join('\n')
+        }`
+
+    // node-backend 타입의 경우, miniboard 프론트엔드가 호출하는 /api/ 와 /health 경로에 대한 추가 프록시 설정 탑재
+    if (isNodeBackend) {
+      locs += `
+
+        # ${b.name} /api/ 추가 프록시 (Miniboard 지원)
+        location /api/ {
+            proxy_pass http://${b.name}_upstream/api/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 60s;
+            proxy_connect_timeout 10s;
+        }
+
+        # ${b.name} /health 추가 프록시 (Miniboard 지원)
+        location = /health {
+            proxy_pass http://${b.name}_upstream/health;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }`
+    }
+
+    return locs
+  }).join('\n')
 
   // healthz 엔드포인트 (Liveness/Readiness Probe 용)
   const healthzLocation = `
@@ -1862,9 +1937,11 @@ export function genGitHubActions(services, cfg = {}) {
     dockerhubUser = '',
   } = cfg
 
-  // ── CI 내부에서 참조하는 kustomization 경로 ──────────
-  // buildAllFiles·buildFileMap의 overlayDir과 반드시 일치해야 함
-  const overlayDir = ['k8s', 'projects', proj, 'overlays', 'production'].join('/')
+  // ── CI 가 이미지 태그를 갱신하는 경로 ──────────────
+  // ⚠️ ArgoCD ApplicationSet 은 services/<svc>/ 폴더를 직접 sync 하고
+  //   overlays/production 은 보지 않는다. 따라서 이미지 태그도 반드시
+  //   services/<svc>/deployment.yaml 에 기록해야 배포에 반영된다.
+  const servicesDir = ['k8s', 'projects', proj, 'services'].join('/')
   const argoName = toK8sName(proj)
 
   const isGHCR = registry === 'ghcr'
@@ -1931,6 +2008,13 @@ ${loginBlock}
 
   const needBuilds = appServices.map(s => `build-${s.name}`).join(', ')
 
+  // 앱 서비스별 deployment.yaml 의 이미지 태그를 이번 커밋 SHA 로 고정하는 sed 라인.
+  // 레지스트리/소유자 대소문자에 무관하도록 이미지 이름 접미사로 매칭한다.
+  // (DB 서비스는 appServices 에 없으므로 postgres:16-alpine 등 공식 이미지는 건드리지 않음)
+  const imageTagSeds = appServices.map(svc =>
+    `          sed -i -E 's#(image: "[^"]*${imageNameOf(svc.name)}):[^"]*"#\\1:\${{ github.sha }}"#' ${servicesDir}/${svc.name}/deployment.yaml`
+  ).join('\n')
+
   return `name: Grad-Deploy CI/CD
 
 on:
@@ -1939,6 +2023,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+
+# 동일 브랜치에서 실행이 겹치면(수동 재실행·연속 push) 이전 실행을 취소해
+# update-manifests 의 git push 충돌을 방지한다.
+concurrency:
+  group: grad-deploy-\${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
 ${buildJobs}
@@ -1968,18 +2058,20 @@ ${buildJobs}
           fi
           echo "✅ 평문 Secret 없음"
 
-      - name: Update image tags in kustomization
+      - name: Pin image tags in service manifests
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           # 1. 수정 전에 먼저 최신 원격 변경사항을 pull (충돌 방지)
           git pull --rebase origin main
-          # 2. 그 다음 Kustomize 이미지 태그 수정
-          cd ${overlayDir}
-          sed -i "s|newTag: .*|newTag: \${{ github.sha }}|g" kustomization.yaml || true
+          # 2. ArgoCD 가 실제로 sync 하는 services/<svc>/deployment.yaml 의
+          #    이미지 태그를 이번 커밋 SHA 로 고정한다.
+          #    (overlays/production/kustomization.yaml 은 ApplicationSet 이 보지 않으므로
+          #     그곳만 갱신하면 새 이미지가 배포되지 않던 버그를 수정)
+${imageTagSeds}
           # 3. 변경 커밋 및 푸시
-          git add kustomization.yaml
-          git diff --staged --quiet || git commit -m "ci: update image tags [\${{ github.sha }}]"
+          git add ${servicesDir}
+          git diff --staged --quiet || git commit -m "ci: pin image tags [\${{ github.sha }}]"
           git push origin main
 
       # [제거됨] Register Repo to ArgoCD 스텝
@@ -1992,25 +2084,32 @@ ${buildJobs}
       # 최초 1회만 처리하므로 워크플로우에서는 sync 만 트리거합니다.
       # (옵션 A: 단일 등록 책임 — bootstrap.sh)
 
-      - name: Trigger Argo CD Sync
+      - name: Trigger Argo CD Sync (optional)
         env:
           ARGOCD_SERVER: \${{ vars.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: \${{ secrets.ARGOCD_TOKEN }}
         run: |
+          # 최초 push 시점에는 ARGOCD_SERVER/TOKEN 이 아직 등록되지 않았을 수 있다.
+          # 이 경우 이 스텝을 실패(빨간 X)시키지 않고 건너뛴다.
+          # ApplicationSet 이 만든 자식 Application 은 automated/selfHeal 로
+          # Git 변경을 자동 sync 하므로, 수동 트리거는 보조 수단일 뿐이다.
+          if [ -z "\${ARGOCD_SERVER}" ] || [ -z "\${ARGOCD_AUTH_TOKEN}" ]; then
+            echo "::notice::ARGOCD_SERVER/ARGOCD_TOKEN 미설정 — 수동 sync 건너뜀 (ArgoCD auto-sync가 반영)"
+            exit 0
+          fi
           HTTP_STATUS=\$(curl -s -o /tmp/sync_resp.json -w "%{http_code}" \\
             -X POST "https://\${ARGOCD_SERVER}/api/v1/applications/${argoName}/sync" \\
             -H "Authorization: Bearer \${ARGOCD_AUTH_TOKEN}" \\
             -H "Content-Type: application/json" \\
             --insecure \\
-            -d '{"prune":true,"strategy":{"hook":{"force":false}}}')
+            -d '{"prune":true,"strategy":{"hook":{"force":false}}}' || echo "000")
           echo "Argo CD Sync HTTP Status: \${HTTP_STATUS}"
-          if [ "\${HTTP_STATUS}" = "401" ]; then
-            echo "::error::ARGOCD_TOKEN 만료. Settings → Accounts → admin → Generate New Token"
-            exit 1
-          elif [ "\${HTTP_STATUS}" = "404" ]; then
-            echo "::error::앱 '${argoName}'이 없음. kubectl apply -f k8s/projects/${proj}/argo-parent-app.yaml -n argocd 필요"
-            exit 1
-          fi`
+          case "\${HTTP_STATUS}" in
+            2*)  echo "✅ Argo CD sync 트리거 완료" ;;
+            401) echo "::warning::ARGOCD_TOKEN 만료 가능 — Settings → Accounts → admin → Generate New Token (auto-sync로 반영됨)" ;;
+            404) echo "::warning::앱 '${argoName}' 미존재 — bootstrap 필요 (auto-sync로 반영됨)" ;;
+            *)   echo "::warning::예기치 못한 응답 \${HTTP_STATUS} — ArgoCD auto-sync에 의존" ;;
+          esac`
 }
 
 // ── ArgoCD Application ────────────────────────────────
@@ -2061,7 +2160,13 @@ spec:
   ignoreDifferences:
     - group: apps
       kind: Deployment
-      jsonPointers: [/spec/replicas]`
+      jsonPointers: [/spec/replicas]
+    # StatefulSet: K8s가 volumeClaimTemplates에 기본값(apiVersion/kind/status)을 주입해
+    # 영구 OutOfSync가 발생하는 것을 방지 (해당 필드는 생성 후 불변)
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates`
 }
 
 // [변경②] ${proj}-project 전달 — genAppProject()와 이름 일치 필수
@@ -2286,7 +2391,14 @@ spec:
       ignoreDifferences:
         - group: apps
           kind: Deployment
-          jsonPointers: [/spec/replicas]`
+          jsonPointers: [/spec/replicas]
+        # StatefulSet(postgres 등): K8s가 volumeClaimTemplates에 apiVersion/kind/status
+        # 등 기본값을 주입해 영구 OutOfSync가 발생한다. 해당 필드 차이를 무시한다.
+        # (volumeClaimTemplates는 생성 후 변경 불가이므로 무시해도 안전)
+        - group: apps
+          kind: StatefulSet
+          jsonPointers:
+            - /spec/volumeClaimTemplates`
 }
 
 
@@ -2990,9 +3102,75 @@ export function buildManifestYAML(services, ns, cloud = 'kind') {
 //       ├── argo-project.yaml         ← AppProject (1단계 수동 apply)
 //       ├── argo-appset.yaml          ← ApplicationSet (2단계 수동 apply)
 //       └── docs/deploy-order.md
-//     k8s/argocd-admin/               ← Admin 전용 (argocd-cm, argocd-rbac-cm)
-//     .github/workflows/              ← CI/CD
-//     Dockerfile.<svcName>
+// 봉인 스크립트 생성 함수 (scripts/seal-secrets.sh 용)
+function genSealSecretsScript(services, ns, proj) {
+  const isSensKey = (key) => {
+    const k = (key || '').toLowerCase()
+    const tokens = k.split('_')
+    const sensitveTokens = ['password', 'secret', 'token', 'auth', 'credential', 'jwt']
+    return tokens.some(t => sensitveTokens.includes(t))
+  }
+
+  // secret을 가진 서비스만 대상
+  const secretSvcs = services.filter(s =>
+    Object.keys(s.env || {}).some(k => isSensKey(k))
+  )
+  if (!secretSvcs.length) return null
+
+  const svcRoot = `k8s/projects/${proj}/services`
+
+  const sealBlocks = secretSvcs.map(svc => {
+    const secretKeys = Object.entries(svc.env || {})
+      .filter(([k]) => isSensKey(k))
+    const literals = secretKeys
+      .map(([k, v]) => `    --from-literal=${k}='${v}'`)
+      .join(' \\\n')
+    return `echo "→ ${svc.name} 봉인 중..."
+kubectl create secret generic ${svc.name}-secret -n ${ns} \\
+${literals} \\
+    --dry-run=client -o yaml \\
+  | kubeseal --controller-namespace kube-system --format yaml \\
+  > ${svcRoot}/${svc.name}/sealed-secret.yaml`
+  }).join('\n\n')
+
+  return `#!/usr/bin/env bash
+# ── Grad-Deploy 자동 생성: SealedSecret 봉인 & push ──
+# 전제: (1) sealed-secrets 컨트롤러가 클러스터에 설치됨
+#       (2) kubeseal CLI 설치됨
+#       (3) 이 스크립트는 '${proj}' 매니페스트가 있는 레포 루트에서 실행
+set -euo pipefail
+
+echo "=== SealedSecret 봉인 시작 ==="
+
+# 컨트롤러 존재 확인
+if ! kubectl get pods -n kube-system -l app.kubernetes.io/name=sealed-secrets \\
+     --no-headers 2>/dev/null | grep -q Running; then
+  echo "✕ sealed-secrets 컨트롤러가 실행 중이 아닙니다. 먼저 설치하세요:" >&2
+  echo "  kubectl apply -f https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.27.1/controller.yaml" >&2
+  exit 1
+fi
+
+${sealBlocks}
+
+echo ""
+echo "→ 평문 secret 검사 (스캐너 시뮬레이션)"
+if grep -rl "^kind: Secret" ${svcRoot}/*/sealed-secret.yaml 2>/dev/null; then
+  echo "✕ sealed-secret.yaml에 평문 kind: Secret 발견 — 중단" >&2
+  exit 1
+fi
+echo "✓ SealedSecret만 존재 (CI 통과 예상)"
+
+echo ""
+echo "→ Git push"
+git add ${svcRoot}/*/sealed-secret.yaml
+git commit -m "chore: add sealed secrets [grad-deploy]" || echo "(변경 없음)"
+git push
+
+echo "=== 완료: ArgoCD가 곧 sync합니다 ==="
+echo "확인: kubectl get sealedsecret -n ${ns}"
+`
+}
+
 export function buildAllFiles(services, cfg = {}) {
   const {
     ns             = 'default',
@@ -3047,11 +3225,17 @@ export function buildAllFiles(services, cfg = {}) {
   // 6번째 인수 proj: buildFileMap이 projRoot 기반 경로를 생성하도록 전달
   // buildFileMap(services, ns, netPolicy, ci, argoApp, proj) 시그니처와 반드시 일치
   const files = envBuildFileMap(services, ns, netPolicyYaml, ciYaml, argoAppYaml, proj)
+
+  const sealScript = genSealSecretsScript(services, ns, proj)
+  if (sealScript) {
+    files[['scripts', 'seal-secrets.sh'].join('/')] = sealScript
+  }
+  const imageCfg = { registry, dockerhubUser, repo: pureRepoUrl, ghUserLogin }
   files[[overlayDir, 'kustomization.yaml'].join('/')] = genOverlayKustomization(
     services,
     ns,
     cloud,
-    { registry, dockerhubUser, repo: pureRepoUrl },
+    imageCfg,
   )
 
   // ── [변경] 배포 순서: AppProject → ApplicationSet → ResourceQuota ──
@@ -3200,7 +3384,7 @@ echo "   rm k8s/projects/\${PROJ}/docs/bootstrap.sh"
   // ApplicationSet의 Git Generator가 이 경로를 폴더 단위로 스캔함
   services.forEach(svc => {
     const base = [svcRoot, svc.name].join('/')   // [변경] projRoot 기반 경로
-    files[[base, 'deployment.yaml'].join('/')] = genDeployment(svc, ns, cloud)
+    files[[base, 'deployment.yaml'].join('/')] = genDeployment(svc, ns, cloud, imageCfg)
     files[[base, 'service.yaml'].join('/')]    = genService(svc, ns, cloud)
 
     const hpa = genHPA(svc, ns)
@@ -3208,6 +3392,10 @@ echo "   rm k8s/projects/\${PROJ}/docs/bootstrap.sh"
 
     const nginxConf = genNginxConf(svc, services, ns)
     if (nginxConf) files[[base, 'nginx-conf.yaml'].join('/')] = nginxConf
+
+    if (svc.type === 'react-nginx' || svc.type === 'nginx') {
+      files[[base, 'cloudflared-tunnel.yaml'].join('/')] = genCloudflaredDeployment(svc, ns)
+    }
 
     files[`Dockerfile.${svc.name}`] = getDockerfileContent(svc, cloud)
   })
@@ -3263,15 +3451,24 @@ echo "   rm k8s/projects/\${PROJ}/docs/bootstrap.sh"
 
   if (miniBackend) {
     files[`Dockerfile.${miniBackend.name}`]   = minisBoardBackendDockerfile(proj, miniBackend.name, miniBackend.port || 3000)
-    files[[svcRoot, miniBackend.name, 'index.js'].join('/')]     = backendIndexSrc
-    files[[svcRoot, miniBackend.name, 'package.json'].join('/')] = backendPkgSrc
-    files[[svcRoot, miniBackend.name, 'package-lock.json'].join('/')] = backendLockSrc
+
+    // ⚠️ [sync 버그 수정] 소스 파일(index.js/package.json/package-lock.json)을
+    //   ArgoCD 감시 경로인 services/<svc>/ 에는 더 이상 두지 않는다.
+    //   Dockerfile 의 build-context 가 sample-apps/backend/ 이므로 빌드에는 불필요하고,
+    //   GitOps 매니페스트 폴더에 비-K8s 파일이 섞이면 혼란을 준다.
+    //   (Docker build-context 전용으로 sample-apps/ 에만 둔다)
+    files[['sample-apps', 'backend', 'index.js'].join('/')]     = backendIndexSrc
+    files[['sample-apps', 'backend', 'package.json'].join('/')] = backendPkgSrc
+    files[['sample-apps', 'backend', 'package-lock.json'].join('/')] = backendLockSrc
   }
 
   if (miniFrontend) {
     files[`Dockerfile.${miniFrontend.name}`]  = getMinisBoardFrontendDockerfile(proj, miniFrontend.name)
-    files[[svcRoot, miniFrontend.name, 'index.html'].join('/')]  = frontendHtmlSrc
-    files[[svcRoot, miniFrontend.name, 'nginx.conf'].join('/')]  = getFrontendNginxSrc(miniBackend ? miniBackend.name : 'node-svc')
+
+    // ⚠️ [sync 버그 수정] 위와 동일 — 정적 소스는 build-context(sample-apps/)에만 둔다.
+    //   services/<svc>/ 에는 nginx-conf.yaml(ConfigMap) 등 K8s 매니페스트만 남긴다.
+    files[['sample-apps', 'frontend', 'index.html'].join('/')]  = frontendHtmlSrc
+    files[['sample-apps', 'frontend', 'nginx.conf'].join('/')]  = getFrontendNginxSrc(miniBackend ? miniBackend.name : 'node-svc')
   }
 
   // ── [신규] 미니 보드 배포 시 접속 URL을 수록한 README.md 자동 생성 ──
@@ -4143,7 +4340,7 @@ bash scripts/check-applicationset.sh
 function minisBoardBackendDockerfile(proj = 'my-app', backendName = 'node-svc', port = 3000) {
   return `FROM node:20-alpine
 WORKDIR /app
-COPY k8s/projects/${proj}/services/${backendName}/ .
+COPY sample-apps/backend/ .
 RUN npm ci --production
 EXPOSE ${port}
 USER node
@@ -4153,8 +4350,8 @@ CMD ["node", "index.js"]`
 // ── minisBoardFrontendDockerfile ─────────────────────────────
 function getMinisBoardFrontendDockerfile(proj = 'my-app', frontendName = 'react-nginx-svc') {
   return `FROM nginx:alpine
-COPY k8s/projects/${proj}/services/${frontendName}/nginx.conf /etc/nginx/conf.d/default.conf
-COPY k8s/projects/${proj}/services/${frontendName}/index.html /usr/share/nginx/html/index.html
+COPY sample-apps/frontend/nginx.conf /etc/nginx/conf.d/default.conf
+COPY sample-apps/frontend/index.html /usr/share/nginx/html/index.html
 EXPOSE 80`
 }
 
@@ -4202,5 +4399,44 @@ cloudflared tunnel --url http://localhost:8081
 
 Argo CD UI를 통해 실시간 배포 상태(Healthy)와 GitHub Actions 빌드 파이프라인의 동기화 상태를 모니터링할 수 있습니다.
 `;
+}
+
+// ── genCloudflaredDeployment ─────────────────────────────────
+export function genCloudflaredDeployment(svc, ns) {
+  return `# Cloudflare Tunnel (cloudflared) Quick Tunnel 배포 파일
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${svc.name}-cloudflared-tunnel
+  namespace: ${ns}
+  labels:
+    app: ${svc.name}-cloudflared-tunnel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${svc.name}-cloudflared-tunnel
+  template:
+    metadata:
+      labels:
+        app: ${svc.name}-cloudflared-tunnel
+    spec:
+      containers:
+      - name: cloudflared
+        image: cloudflare/cloudflared:latest
+        args:
+        - tunnel
+        - --no-autoupdate
+        - run
+        - --url
+        - http://${svc.name}.${ns}.svc.cluster.local:80
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+`
 }
 

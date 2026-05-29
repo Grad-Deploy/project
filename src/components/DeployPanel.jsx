@@ -13,6 +13,7 @@ import {
 } from '../generators/k8s_improved'
 import { encryptForGithub } from '../utils/sealedBox'
 import { argoAutoSetup } from '../utils/argoAutoSetup'
+import { splitEnvEntries } from '../utils/envManager'
 
 const FSM = [
   { q: 'q0', label: 'Draft', color: 'var(--t3)' },
@@ -97,82 +98,92 @@ async function ghFetchExistingProjects(pat, owner, repo) {
   }
 }
 
-async function ghPushFiles(pat, owner, repo, files) {
-  const base = `https://api.github.com/repos/${owner}/${repo}/contents`
-  const results = []
-
-  // 헬퍼: 일정 시간 대기
-  const sleep = ms => new Promise(r => setTimeout(r, ms))
-
-  for (const [path, content] of Object.entries(files)) {
-    let lastError = null
-    let success = false
-
-    // 최대 3회 재시도 (409 Conflict 등 일시적 충돌 대비)
-    // GitHub Contents API 는 동일 repo 에 빠른 연속 PUT 시
-    // 내부 Git ref 갱신 전에 다음 요청이 들어와 409 를 반환할 수 있음.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        // 1) 현재 파일의 SHA 조회 (기존 파일이면 갱신, 신규면 생성)
-        let sha
-        try {
-          const r = await fetch(`${base}/${path}`, {
-            headers: { Authorization: `token ${pat}`, Accept: 'application/vnd.github.v3+json' },
-          })
-          if (r.ok) { const d = await r.json(); sha = d.sha }
-        } catch (_) { }
-
-        // 2) PUT 으로 파일 업로드
-        const r = await fetch(`${base}/${path}`, {
-          method: 'PUT',
-          headers: { Authorization: `token ${pat}`, 'Content-Type': 'application/json', Accept: 'application/vnd.github.v3+json' },
-          body: JSON.stringify({
-            message: `chore: grad-deploy [${path}]`,
-            content: btoa(unescape(encodeURIComponent(content))),
-            ...(sha ? { sha } : {}),
-          }),
-        })
-
-        if (r.ok) {
-          results.push({ path, ok: true, status: r.status })
-          success = true
-          break
-        }
-
-        // 실패 응답 본문도 함께 수집해 사용자에게 노출
-        const errBody = await r.json().catch(() => ({}))
-        lastError = {
-          path,
-          ok: false,
-          status: r.status,
-          message: errBody.message || '',
-          documentation_url: errBody.documentation_url || '',
-        }
-
-        // 409 Conflict 는 재시도 대상 (잠시 대기 후 재시도)
-        // 422 Unprocessable Entity 는 SHA 불일치 — SHA 재조회를 위해 재시도
-        if (r.status === 409 || r.status === 422) {
-          await sleep(500 * (attempt + 1))   // 백오프: 500ms, 1000ms
-          continue
-        }
-
-        // 그 외 에러는 즉시 실패 처리
-        break
-      } catch (e) {
-        lastError = { path, ok: false, error: e.message }
-        await sleep(500 * (attempt + 1))
-      }
-    }
-
-    if (!success) {
-      results.push(lastError || { path, ok: false, status: 'unknown' })
-    }
-
-    // GitHub Contents API 연속 호출 시 ref 갱신 race condition 회피
-    // (특히 같은 디렉터리 내 파일들 사이)
-    await sleep(150)
+async function ghPushFiles(pat, owner, repo, files, branch = 'main') {
+  // ⚠️ [CI 버그 수정] 기존에는 Contents API 로 파일을 1개씩 PUT → 파일마다 별도 커밋이
+  //   생성되어, main 에 push 될 때마다 CI 워크플로우가 N번 트리거되었다.
+  //   각 실행의 update-manifests 가 git push 할 때, 앱이 아직 다음 파일들을 계속
+  //   push 중이라 non-fast-forward / 충돌로 대부분의 실행이 실패했다.
+  //   → Git Data API(tree → commit → ref)로 "단일 커밋" push 하여 CI 실행을 1회로 만든다.
+  const api = `https://api.github.com/repos/${owner}/${repo}`
+  const headers = {
+    Authorization: `token ${pat}`,
+    Accept: 'application/vnd.github.v3+json',
+    'Content-Type': 'application/json',
   }
-  return results
+  const entries = Object.entries(files)
+  const failAll = (msg, status) =>
+    entries.map(([path]) => ({ path, ok: false, status: status || 'commit-failed', message: msg }))
+
+  try {
+    // 1) 베이스 커밋/트리 조회. 빈 레포(커밋 없음)면 parents 없이 최초 커밋을 만든다.
+    let baseCommitSha = null
+    let baseTreeSha = null
+    let refExists = false
+    const refRes = await fetch(`${api}/git/ref/heads/${branch}`, { headers })
+    if (refRes.ok) {
+      refExists = true
+      baseCommitSha = (await refRes.json()).object.sha
+      const cRes = await fetch(`${api}/git/commits/${baseCommitSha}`, { headers })
+      if (cRes.ok) baseTreeSha = (await cRes.json()).tree.sha
+    }
+    // refRes 가 404/409(빈 레포)면 refExists=false 로 최초 커밋 경로 진행
+
+    // 2) 트리 생성 — 텍스트 파일은 content 를 인라인으로 전달 (별도 blob 생성 불필요)
+    //    base_tree 를 지정하면 기존 파일(이전 배포분 등)은 유지하고 우리 파일만 덮어쓴다.
+    const treeItems = entries.map(([path, content]) => ({
+      path,
+      mode: '100644',
+      type: 'blob',
+      content: String(content),
+    }))
+    const treeRes = await fetch(`${api}/git/trees`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ tree: treeItems, ...(baseTreeSha ? { base_tree: baseTreeSha } : {}) }),
+    })
+    if (!treeRes.ok) {
+      const e = await treeRes.json().catch(() => ({}))
+      return failAll(`Git 트리 생성 실패: ${e.message || ''}`, treeRes.status)
+    }
+    const newTreeSha = (await treeRes.json()).sha
+
+    // 3) 커밋 생성 (단일 커밋)
+    const commitRes = await fetch(`${api}/git/commits`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        message: 'chore: grad-deploy 배포 매니페스트 일괄 생성',
+        tree: newTreeSha,
+        ...(baseCommitSha ? { parents: [baseCommitSha] } : {}),
+      }),
+    })
+    if (!commitRes.ok) {
+      const e = await commitRes.json().catch(() => ({}))
+      return failAll(`Git 커밋 생성 실패: ${e.message || ''}`, commitRes.status)
+    }
+    const newCommitSha = (await commitRes.json()).sha
+
+    // 4) 브랜치 ref 갱신 (없으면 생성)
+    const updateRes = refExists
+      ? await fetch(`${api}/git/refs/heads/${branch}`, {
+          method: 'PATCH',
+          headers,
+          body: JSON.stringify({ sha: newCommitSha, force: false }),
+        })
+      : await fetch(`${api}/git/refs`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: newCommitSha }),
+        })
+    if (!updateRes.ok) {
+      const e = await updateRes.json().catch(() => ({}))
+      return failAll(`브랜치 '${branch}' 갱신 실패: ${e.message || ''}`, updateRes.status)
+    }
+
+    return entries.map(([path]) => ({ path, ok: true, status: 200 }))
+  } catch (e) {
+    return failAll(e.message)
+  }
 }
 
 // GitHub Secrets API
@@ -316,6 +327,82 @@ export default function DeployPanel({ state, engineResult, set }) {
   const [repos, setRepos] = useState([])
   const [results, setResults] = useState(null)
   const [isAdvancedMode, setIsAdvancedMode] = useState(false) // [신규] Simple/Advanced 토글
+
+  // ── [신규] Cloudflare Tunnel 상태 관리 및 백그라운드 트래킹
+  const [tunnelUrl, setTunnelUrl] = useState(null)
+  const [tunnelLoading, setTunnelLoading] = useState(false)
+  const [tunnelError, setTunnelError] = useState(null)
+
+  const startTunnelUrlTracking = async (proj, ns, argoServer, argoUser, argoPass, argoToken) => {
+    setTunnelLoading(true)
+    setTunnelError(null)
+    setTunnelUrl(null)
+
+    const serverTrimmed = (argoServer || '').trim().replace(/\/+$/, '')
+    let token = argoToken
+
+    // 토큰이 없고 패스워드가 있는 경우 토큰 로그인 선인증
+    if (!token && argoPass) {
+      try {
+        token = await argoFetchToken(serverTrimmed, argoUser, argoPass)
+      } catch (err) {
+        console.warn('[tunnel-url tracking] Argo CD 로그인 실패:', err.message)
+        setTunnelError(`Argo CD 로그인 실패: ${err.message}`)
+        setTunnelLoading(false)
+        return
+      }
+    }
+
+    if (!token) {
+      setTunnelError('Argo CD 인증 정보를 확보할 수 없어 터널 도메인을 추적할 수 없습니다.')
+      setTunnelLoading(false)
+      return
+    }
+
+    const maxAttempts = 30 // 최대 90초 (3초 간격)
+    let attempt = 0
+
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/tunnel-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            proj,
+            namespace: ns,
+            argoServer: serverTrimmed,
+            argoToken: token
+          })
+        })
+
+        const data = await res.json()
+        if (res.ok && data.url) {
+          setTunnelUrl(data.url)
+          setTunnelLoading(false)
+          return
+        }
+
+        attempt++
+        if (attempt < maxAttempts) {
+          setTimeout(poll, 3000)
+        } else {
+          setTunnelError(data.error || '터널 발급 대기 시간이 초과되었습니다.')
+          setTunnelLoading(false)
+        }
+      } catch (err) {
+        attempt++
+        if (attempt < maxAttempts) {
+          setTimeout(poll, 3000)
+        } else {
+          setTunnelError(err.message)
+          setTunnelLoading(false)
+        }
+      }
+    }
+
+    // 10초 대기 후 최초 폴링 구동 (K8s Pod 부팅 타임 제공)
+    setTimeout(poll, 10000)
+  }
 
   const {
     pat, ghUser, deployMode, selectedRepo, newRepoName, newRepoPrivate,
@@ -476,6 +563,9 @@ export default function DeployPanel({ state, engineResult, set }) {
           ].filter(Boolean).join(' '),
           argoServerUrl: state.argocdServer,
           bootstrapCmd: null,
+          sealCmd: null,
+          secretCmd: null,
+          portForwardCmd: null,
           bootstrap: null,
           bootstrapError: null,
         })
@@ -595,7 +685,122 @@ export default function DeployPanel({ state, engineResult, set }) {
 
       // 복사할 원라인 명령어셋 구성 (pure URL 및 올바른 pat 변수 사용)
       const safeProjectName = toK8sName(state.proj)
-      const dynamicBootstrapCmd = `export GITHUB_PAT="<YOUR_GITHUB_PAT>" && kubectl create secret generic ${safeProjectName}-git-repo-creds -n argocd --from-literal=type="git" --from-literal=url="${repoUrl}" --from-literal=username="${ghUser.login}" --from-literal=password="$GITHUB_PAT" --dry-run=client -o yaml | kubectl apply --validate=false -f - && kubectl label secret ${safeProjectName}-git-repo-creds -n argocd argocd.argoproj.io/secret-type=repository --overwrite && curl -s -H "Authorization: token $GITHUB_PAT" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-project.yaml" | kubectl apply --validate=false -n argocd -f - && curl -s -H "Authorization: token $GITHUB_PAT" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-parent-app.yaml" | kubectl apply --validate=false -n argocd -f - && curl -s -H "Authorization: token $GITHUB_PAT" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-appset.yaml" | kubectl apply --validate=false -n argocd -f -`;
+      const ns = state.ns || 'default'
+
+      // ── 앱 Secret 을 클러스터에 직접 생성하는 명령어 구성 ────────────────
+      // [sync 버그 수정] Secret 매니페스트는 Git 에 커밋하지 않고(평문 금지),
+      //   kustomization 도 sealed-secret.yaml 을 참조하지 않는다. 따라서 DB 비밀번호
+      //   등은 부트스트랩 단계에서 `kubectl create secret` 으로 직접 생성한다.
+      //   deployment.yaml 의 envFrom.secretRef 는 optional: true 이므로 순서에 안전.
+      const appSecretCmds = (services || [])
+        .map(svc => {
+          const { secretEntries } = splitEnvEntries(svc.env || {}, svc.type)
+          if (!secretEntries.length) return null
+          const literals = secretEntries
+            .map(([k, v]) => `--from-literal=${k}='${String(v).replace(/'/g, "'\\''")}'`)
+            .join(' ')
+          return `kubectl create secret generic ${svc.name}-secret -n ${ns} ${literals} --dry-run=client -o yaml | kubectl apply -f -`
+        })
+        .filter(Boolean)
+
+      // 봉인(SealedSecret) 방식은 더 이상 sync 경로에 연결되지 않으므로 안내하지 않는다.
+      const sealedSecretCmds = '';
+
+      // ── [필수] DB/앱 Secret 생성 명령어 (단독 블록으로 강조 노출) ──────────
+      // 이 단계를 빠뜨리면 postgres 가 "POSTGRES_PASSWORD is not specified" 로
+      // CrashLoopBackOff 가 발생한다(secret 미존재 → optional secretRef 무시).
+      // 따라서 부트스트랩과 별개로, 반드시 실행해야 하는 명령어를 따로 보여준다.
+      const secretCreateCmd = appSecretCmds.length
+        ? [
+            `kubectl create namespace ${ns} --dry-run=client -o yaml | kubectl apply -f -`,
+            ...appSecretCmds,
+          ].join('\n')
+        : '';
+
+      const dynamicBootstrapCmd = [
+        `export GITHUB_PAT="<YOUR_GITHUB_PAT>"`,
+        `kubectl create secret generic ${safeProjectName}-git-repo-creds -n argocd --from-literal=type="git" --from-literal=url="${repoUrl}" --from-literal=username="${ghUser.login}" --from-literal=password="$GITHUB_PAT" --dry-run=client -o yaml | kubectl apply --validate=false -f -`,
+        `kubectl label secret ${safeProjectName}-git-repo-creds -n argocd argocd.argoproj.io/secret-type=repository --overwrite`,
+        `curl -s -H "Authorization: token $GITHUB_PAT" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-project.yaml" | kubectl apply --validate=false -n argocd -f -`,
+        `curl -s -H "Authorization: token $GITHUB_PAT" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-parent-app.yaml" | kubectl apply --validate=false -n argocd -f -`,
+        `curl -s -H "Authorization: token $GITHUB_PAT" -L "${rawRepoUrl}/main/k8s/projects/${state.proj}/argo-appset.yaml" | kubectl apply --validate=false -n argocd -f -`,
+        `kubectl create namespace ${ns} --dry-run=client -o yaml | kubectl apply -f -`,
+        `kubectl create secret docker-registry ghcr-secret --docker-server=ghcr.io --docker-username="${ghUser.login}" --docker-password="$GITHUB_PAT" --docker-email=user@example.com -n ${ns} --dry-run=client -o yaml | kubectl apply -f -`,
+        ...appSecretCmds,
+      ].join(' && ');
+
+      const frontendSvc = (services || []).find(s => s.type === 'react-nginx') || (services || []).find(s => s.type === 'nginx') || { name: 'react-nginx-svc' }
+      const frontendName = frontendSvc.name
+      const dynamicPortForwardCmd = `kubectl wait --for=condition=ready pod -l app=${frontendName} -n ${ns} --timeout=300s && kubectl port-forward svc/${frontendName} -n ${ns} 8081:80`;
+
+      // ── [신규] 클러스터에 Secret 자동 생성 및 Pod 재시작 통합 ────────────────
+      const secretsToCreate = (services || [])
+        .map(svc => {
+          const { secretEntries } = splitEnvEntries(svc.env || {}, svc.type)
+          if (!secretEntries.length) return null
+          const data = {}
+          secretEntries.forEach(([k, v]) => {
+            data[k] = String(v)
+          })
+          return {
+            name: `${svc.name}-secret`,
+            data,
+            svcName: svc.name
+          }
+        })
+        .filter(Boolean)
+
+      let secretsAppliedResult = null
+      if (secretsToCreate.length > 0) {
+        try {
+          const secRes = await fetch('/api/apply-secrets', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              namespace: ns,
+              secrets: secretsToCreate,
+            }),
+          })
+          if (secRes.ok) {
+            secretsAppliedResult = await secRes.json()
+          } else {
+            const errData = await secRes.json().catch(() => ({}))
+            secretsAppliedResult = { ok: false, error: errData.error || `HTTP ${secRes.status}` }
+          }
+        } catch (e) {
+          secretsAppliedResult = { ok: false, error: e.message }
+        }
+      }
+
+      // ── [신규] 로컬 포트 포워딩 자동 구동 ────────────────
+      let portForwardResult = null
+      if (frontendName) {
+        try {
+          const pfRes = await fetch('/api/port-forward', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              serviceName: frontendName,
+              namespace: ns,
+              localPort: 8081,
+              containerPort: frontendSvc.port || 80
+            })
+          })
+          if (pfRes.ok) {
+            portForwardResult = await pfRes.json()
+          } else {
+            const errData = await pfRes.json().catch(() => ({}))
+            portForwardResult = { ok: false, error: errData.error || `HTTP ${pfRes.status}` }
+          }
+        } catch (e) {
+          portForwardResult = { ok: false, error: e.message }
+        }
+      }
+
+      // ── [신규] 외부 터널 도메인 추적 개시 ────────────────
+      if (frontendName && canAutoArgo) {
+        startTunnelUrlTracking(state.proj, ns, finalArgoServer, finalArgoUser, finalArgoPass, finalArgoToken)
+      }
 
       setResults({
         repo: `${owner}/${repo}`,
@@ -607,8 +812,13 @@ export default function DeployPanel({ state, engineResult, set }) {
         argoSetupError,
         argoServerUrl: state.argocdServer,
         bootstrapCmd: dynamicBootstrapCmd,
+        sealCmd: sealedSecretCmds,
+        secretCmd: secretCreateCmd,
+        portForwardCmd: dynamicPortForwardCmd,
         bootstrap: bootstrapResult,
         bootstrapError,
+        secretsApplied: secretsAppliedResult,
+        portForwardApplied: portForwardResult,
       })
 
       // 5. 새 레포면 목록 갱신 + 모드 전환
@@ -977,6 +1187,106 @@ export default function DeployPanel({ state, engineResult, set }) {
             ))}
           </div>
 
+          {/* DB/앱 Secret 자동 생성 결과 */}
+          {results.secretsApplied && (
+            <div style={{
+              marginTop: 16,
+              padding: 14,
+              background: results.secretsApplied.ok ? 'rgba(74,222,128,0.07)' : 'rgba(248,113,113,0.06)',
+              borderRadius: 'var(--r2)',
+              border: `1px solid ${results.secretsApplied.ok ? 'rgba(74,222,128,0.3)' : 'rgba(248,113,113,0.3)'}`,
+            }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: results.secretsApplied.ok ? 'var(--green)' : 'var(--red)' }}>
+                {results.secretsApplied.ok ? '🔒 DB/앱 Secrets 클러스터 자동 생성 완료' : '⚠ DB/앱 Secrets 자동 생성 실패'}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--t2)', marginTop: 6, lineHeight: 1.6 }}>
+                {results.secretsApplied.ok ? (
+                  <>
+                    클러스터({state.ns || 'default'})에 Secret이 자동으로 생성 및 적용되었습니다.
+                    <br />
+                    관련 Pod들이 안전하게 자동 재기동(delete & recreate)되었습니다.
+                  </>
+                ) : (
+                  <>
+                    실패 사유: {results.secretsApplied.error}
+                    <br />
+                    아래의 [필수 — DB/앱 SECRET 생성 명령어]를 직접 복사하여 실행해 주세요.
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* 로컬 포트 포워딩 자동 구동 결과 */}
+          {results.portForwardApplied && (
+            <div style={{
+              marginTop: 16,
+              padding: 14,
+              background: results.portForwardApplied.ok ? 'rgba(96,165,250,0.08)' : 'rgba(248,113,113,0.06)',
+              borderRadius: 'var(--r2)',
+              border: `1px solid ${results.portForwardApplied.ok ? 'rgba(96,165,250,0.3)' : 'rgba(248,113,113,0.3)'}`,
+            }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: results.portForwardApplied.ok ? 'var(--blue)' : 'var(--red)' }}>
+                {results.portForwardApplied.ok ? '⚡ 로컬 포트포워딩(8081:80) 자동 시작 완료' : '⚠ 로컬 포트포워딩 자동 시작 실패'}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--t2)', marginTop: 6, lineHeight: 1.6 }}>
+                {results.portForwardApplied.ok ? (
+                  <>
+                    백그라운드에서 `kubectl port-forward` 프로세스가 자동으로 실행되었습니다.
+                    <br />
+                    아래 주소를 클릭하면 미니보드 웹에 즉시 접속할 수 있습니다:
+                    <br />
+                    👉 <a href="http://localhost:8081" target="_blank" rel="noreferrer" style={{ color: 'var(--blue)', fontWeight: 'bold', textDecoration: 'underline' }}>http://localhost:8081</a>
+                  </>
+                ) : (
+                  <>
+                    실패 사유: {results.portForwardApplied.error}
+                    <br />
+                    아래의 [포트포워딩 명령어]를 직접 복사하여 실행해 주세요.
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Cloudflare 외부 터널 자동 구동 결과 */}
+          {(tunnelLoading || tunnelUrl || tunnelError) && (
+            <div style={{
+              marginTop: 16,
+              padding: 14,
+              background: tunnelUrl ? 'rgba(16,185,129,0.08)' : tunnelError ? 'rgba(248,113,113,0.06)' : 'rgba(245,158,11,0.06)',
+              borderRadius: 'var(--r2)',
+              border: `1px solid ${tunnelUrl ? 'rgba(16,185,129,0.3)' : tunnelError ? 'rgba(248,113,113,0.3)' : 'rgba(245,158,11,0.3)'}`,
+            }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: tunnelUrl ? '#10b981' : tunnelError ? 'var(--red)' : '#f59e0b' }}>
+                {tunnelUrl ? '🌐 Cloudflare 외부 인터넷 접속 도메인 개설 완료' : tunnelError ? '⚠ 외부 인터넷 터널 연결 실패' : '🔄 외부 인터넷 접속 도메인 개설 중...'}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--t2)', marginTop: 6, lineHeight: 1.6 }}>
+                {tunnelUrl ? (
+                  <>
+                    클러스터 내부의 `cloudflared` Quick Tunnel 데몬이 성공적으로 인터넷망과 연결되었습니다.
+                    <br />
+                    아래 주소를 클릭하면 외부/모바일 기기에서도 포트포워딩 없이 즉시 접속 가능합니다:
+                    <br />
+                    👉 <a href={tunnelUrl} target="_blank" rel="noreferrer" style={{ color: '#10b981', fontWeight: 'bold', textDecoration: 'underline' }}>{tunnelUrl}</a>
+                  </>
+                ) : tunnelError ? (
+                  <>
+                    실패 사유: {tunnelError}
+                    <br />
+                    Argo CD에서 `cloudflared-tunnel` Pod가 정상적으로 Healthy 상태로 동기화되었는지 확인해 주십시오.
+                  </>
+                ) : (
+                  <>
+                    클러스터 내부에서 Cloudflare Edge망과의 보안 터널 세션을 동적으로 조율하고 있습니다.
+                    <br />
+                    약 10~15초 소요되며, 주소가 감지되면 자동으로 이 카드에 노출됩니다.
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* ArgoCD 자동 연동 결과 */}
           {results.bootstrap && (
             <div style={{
@@ -1133,6 +1443,147 @@ export default function DeployPanel({ state, engineResult, set }) {
               }}>
                 <span style={{ color: 'var(--blue)', fontWeight: 800 }}>TIP</span>
                 <span>위 명령어를 복사하여 K8s 터미널에 붙여넣으세요. Argo CD가 Private 레포를 즉시 인식합니다.</span>
+              </div>
+            </div>
+          )}
+
+          {/* ── [필수] DB/앱 Secret 생성 명령어 ──────────────── */}
+          {results.secretCmd && (
+            <div style={{ marginTop: 20 }}>
+              <div style={{ fontSize: 10, color: '#f87171', marginBottom: 8, letterSpacing: '0.06em', fontWeight: 700 }}>
+                ⚠ 필수 — DB/앱 SECRET 생성 명령어 (실행하지 않으면 postgres가 CrashLoopBackOff)
+              </div>
+              <div style={{
+                padding: '14px', background: 'rgba(0,0,0,0.3)', borderRadius: 'var(--r2)',
+                border: '1px solid rgba(248,113,113,0.4)', position: 'relative',
+                boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.2)'
+              }}>
+                <pre style={{
+                  fontSize: 11, color: 'var(--cyan)', whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-all', margin: 0, fontFamily: 'var(--mono)',
+                  lineHeight: 1.5
+                }}>
+                  {results.secretCmd}
+                </pre>
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(results.secretCmd)
+                    alert('Secret 생성 명령어가 복사되었습니다! K8s 터미널에서 실행하세요.')
+                  }}
+                  style={{
+                    position: 'absolute', top: 10, right: 10,
+                    padding: '5px 10px', fontSize: 10, fontWeight: 700,
+                    background: '#f87171', color: '#0b0f1c',
+                    border: 'none', borderRadius: 4, cursor: 'pointer',
+                    transition: 'transform 0.1s',
+                  }}
+                  onMouseDown={e => e.currentTarget.style.transform = 'scale(0.95)'}
+                  onMouseUp={e => e.currentTarget.style.transform = 'scale(1)'}
+                >
+                  COPY
+                </button>
+              </div>
+              <div style={{
+                marginTop: 8, padding: '8px 12px', borderRadius: 6,
+                background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.15)',
+                fontSize: 10, color: 'var(--t3)', display: 'flex', gap: 8, alignItems: 'center'
+              }}>
+                <span style={{ color: '#f87171', fontWeight: 800 }}>주의</span>
+                <span>DB 비밀번호 등 Secret은 Git에 커밋하지 않으므로 클러스터에 직접 생성해야 합니다. 이 명령어를 실행한 뒤 <code>kubectl delete pod postgres-svc-0 -n {state.ns || 'default'}</code> 로 재기동하세요.</span>
+              </div>
+            </div>
+          )}
+
+          {/* ── Sealed Secrets 봉인 명령어 (로컬 기밀 암호화) ──────────────── */}
+          {results.sealCmd && (
+            <div style={{ marginTop: 20 }}>
+              <div style={{ fontSize: 10, color: 'var(--t3)', marginBottom: 8, letterSpacing: '0.06em', fontWeight: 600 }}>
+                SEALED SECRETS 봉인 명령어 (로컬 기밀 암호화 & Git Push)
+              </div>
+              <div style={{
+                padding: '14px', background: 'rgba(0,0,0,0.3)', borderRadius: 'var(--r2)',
+                border: '1px solid var(--border)', position: 'relative',
+                boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.2)'
+              }}>
+                <pre style={{
+                  fontSize: 11, color: 'var(--cyan)', whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-all', margin: 0, fontFamily: 'var(--mono)',
+                  lineHeight: 1.5
+                }}>
+                  {results.sealCmd}
+                </pre>
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(results.sealCmd)
+                    alert('Sealed Secrets 봉인 명령어가 복사되었습니다!')
+                  }}
+                  style={{
+                    position: 'absolute', top: 10, right: 10,
+                    padding: '5px 10px', fontSize: 10, fontWeight: 700,
+                    background: 'var(--blue)', color: '#0b0f1c',
+                    border: 'none', borderRadius: 4, cursor: 'pointer',
+                    transition: 'transform 0.1s',
+                  }}
+                  onMouseDown={e => e.currentTarget.style.transform = 'scale(0.95)'}
+                  onMouseUp={e => e.currentTarget.style.transform = 'scale(1)'}
+                >
+                  COPY
+                </button>
+              </div>
+              <div style={{
+                marginTop: 8, padding: '8px 12px', borderRadius: 6,
+                background: 'rgba(96,165,250,0.08)', border: '1px solid rgba(96,165,250,0.15)',
+                fontSize: 10, color: 'var(--t3)', display: 'flex', gap: 8, alignItems: 'center'
+              }}>
+                <span style={{ color: 'var(--blue)', fontWeight: 800 }}>TIP</span>
+                <span>클론한 레포 루트 폴더에서 위 명령어를 실행하면, 평문 DB 기밀 정보를 자동으로 암호화하여 sealed-secret.yaml을 생성한 뒤 원격 저장소에 푸시합니다.</span>
+              </div>
+            </div>
+          )}
+
+          {/* ── Mini Board 포트포워딩 명령어 ──────────────── */}
+          {results.portForwardCmd && (
+            <div style={{ marginTop: 20 }}>
+              <div style={{ fontSize: 10, color: 'var(--t3)', marginBottom: 8, letterSpacing: '0.06em', fontWeight: 600 }}>
+                MINI BOARD PORT-FORWARD 명령어 (로컬 접속용)
+              </div>
+              <div style={{
+                padding: '14px', background: 'rgba(0,0,0,0.3)', borderRadius: 'var(--r2)',
+                border: '1px solid var(--border)', position: 'relative',
+                boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.2)'
+              }}>
+                <pre style={{
+                  fontSize: 11, color: 'var(--cyan)', whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-all', margin: 0, fontFamily: 'var(--mono)',
+                  lineHeight: 1.5
+                }}>
+                  {results.portForwardCmd}
+                </pre>
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(results.portForwardCmd)
+                    alert('Mini Board 포트포워딩 명령어가 복사되었습니다!')
+                  }}
+                  style={{
+                    position: 'absolute', top: 10, right: 10,
+                    padding: '5px 10px', fontSize: 10, fontWeight: 700,
+                    background: 'var(--blue)', color: '#0b0f1c',
+                    border: 'none', borderRadius: 4, cursor: 'pointer',
+                    transition: 'transform 0.1s',
+                  }}
+                  onMouseDown={e => e.currentTarget.style.transform = 'scale(0.95)'}
+                  onMouseUp={e => e.currentTarget.style.transform = 'scale(1)'}
+                >
+                  COPY
+                </button>
+              </div>
+              <div style={{
+                marginTop: 8, padding: '8px 12px', borderRadius: 6,
+                background: 'rgba(96,165,250,0.08)', border: '1px solid rgba(96,165,250,0.15)',
+                fontSize: 10, color: 'var(--t3)', display: 'flex', gap: 8, alignItems: 'center'
+              }}>
+                <span style={{ color: 'var(--blue)', fontWeight: 800 }}>TIP</span>
+                <span>위 명령어를 복사하여 K8s 터미널에 붙여넣으세요. 파드가 준비되는 즉시 Mini Board 포트포워딩(8081)이 백그라운드에서 실행됩니다.</span>
               </div>
             </div>
           )}

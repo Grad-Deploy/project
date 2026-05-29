@@ -741,10 +741,8 @@ export function resolveGithubSecretName(k, svc) {
 export function genSecretFile(svc, ns) {
   const { secretEntries } = splitEnvEntries(svc.env || {}, svc.type)
   if (!secretEntries.length) return null
-
-  return `# ⚠️ 이 파일은 .gitignore로 보호됩니다
-# GitHub Actions에서 Secrets를 통해 값이 주입됩니다
-apiVersion: v1
+  const b64 = v => btoa(unescape(encodeURIComponent(String(v))))
+  return `apiVersion: v1
 kind: Secret
 metadata:
   name: ${svc.name}-secret
@@ -753,8 +751,8 @@ metadata:
     app: ${svc.name}
     app.kubernetes.io/managed-by: grad-deploy
 type: Opaque
-stringData:
-${secretEntries.map(([k]) => `  ${k}: "\${{ secrets.${resolveGithubSecretName(k, svc)} }}"`).join('\n')}`
+data:
+${secretEntries.map(([k, v]) => `  ${k}: ${b64(v)}`).join('\n')}`
 }
 
 /**
@@ -800,11 +798,17 @@ export function buildFileMap(services, ns, netPolicyYaml, ciYaml, argoYaml, proj
 
     // kustomization.yaml (서비스 폴더 내 base kustomization)
     // nginx/react-nginx 타입은 nginx-conf.yaml도 포함
-    const hasSecret = Object.keys(svc.env || {}).some(k => isSensitiveKey(k))
+    //
+    // ⚠️ [sync 버그 수정] sealed-secret.yaml 은 더 이상 resources 에 추가하지 않는다.
+    //   기존: hasSecret 이면 'sealed-secret.yaml' 을 참조했으나, 이 파일은
+    //   Git 에 커밋되지 않으므로(평문 Secret 커밋 금지 + 봉인은 클러스터에서만 가능)
+    //   ArgoCD 가 `kustomize build` 시 "no such file or directory" 로 실패 →
+    //   Application 이 ComparisonError 로 sync 되지 않는 원인이었다.
+    //   → Secret 은 부트스트랩 단계에서 `kubectl create secret` 으로 직접 생성하고
+    //     deployment.yaml 의 envFrom.secretRef 는 optional: true 로 참조한다.
     const isNginxType = (svc.type === 'nginx' || svc.type === 'react-nginx')
     const resources = ['deployment.yaml', 'service.yaml', 'configmap.yaml']
     if (isNginxType) resources.push('nginx-conf.yaml')
-    if (hasSecret) resources.push('secret.yaml')
     files[[base, 'kustomization.yaml'].join('/')] = `apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -857,8 +861,8 @@ export function generateGitignore() {
 
 # 평문 Secret 파일 (.gitignore가 자동 보호)
 **/secret.yaml
-**/secrets.yaml
 **/*-secret.yaml
+**/secrets.yaml
 **/*-secrets.yaml
 
 # 환경변수 파일
