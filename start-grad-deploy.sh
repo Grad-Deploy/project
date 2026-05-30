@@ -194,11 +194,11 @@ tmux send-keys -t "$SESSION_NAME":pf-argocd \
 sleep 3
 
 tmux new-window -t "$SESSION_NAME" -n backend
-tmux send-keys -t "$SESSION_NAME":backend "cd $SERVER_DIR" C-m
+tmux send-keys -t "$SESSION_NAME":backend "cd \"$SERVER_DIR\"" C-m
 tmux send-keys -t "$SESSION_NAME":backend "npm run dev" C-m
 
 tmux new-window -t "$SESSION_NAME" -n frontend
-tmux send-keys -t "$SESSION_NAME":frontend "cd $PROJECT_DIR" C-m
+tmux send-keys -t "$SESSION_NAME":frontend "cd \"$PROJECT_DIR\"" C-m
 tmux send-keys -t "$SESSION_NAME":frontend "npm run dev" C-m
 
 sleep 5

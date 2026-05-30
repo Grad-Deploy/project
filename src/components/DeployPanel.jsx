@@ -750,8 +750,16 @@ export default function DeployPanel({ state, engineResult, set }) {
         })
         .filter(Boolean)
 
+      // GHCR(private) 이미지 Pull 을 위한 imagePullSecret(ghcr-secret) 자동 생성.
+      //   deployment.yaml 이 ghcr-secret 을 참조하므로, registry 가 ghcr 일 때는
+      //   앱 Secret 이 없더라도 반드시 이 Secret 을 클러스터에 만들어 줘야
+      //   node-svc 등 빌드 이미지 기반 Pod 가 ImagePullBackOff 없이 생성된다.
+      const ghcrCreds = (registry === 'ghcr' && ghUser?.login && pat)
+        ? { username: ghUser.login, pat }
+        : null
+
       let secretsAppliedResult = null
-      if (secretsToCreate.length > 0) {
+      if (secretsToCreate.length > 0 || ghcrCreds) {
         try {
           const secRes = await fetch('/api/apply-secrets', {
             method: 'POST',
@@ -759,6 +767,7 @@ export default function DeployPanel({ state, engineResult, set }) {
             body: JSON.stringify({
               namespace: ns,
               secrets: secretsToCreate,
+              ghcr: ghcrCreds,
             }),
           })
           if (secRes.ok) {
@@ -1227,14 +1236,18 @@ export default function DeployPanel({ state, engineResult, set }) {
               border: `1px solid ${results.portForwardApplied.ok ? 'rgba(96,165,250,0.3)' : 'rgba(248,113,113,0.3)'}`,
             }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: results.portForwardApplied.ok ? 'var(--blue)' : 'var(--red)' }}>
-                {results.portForwardApplied.ok ? '⚡ 로컬 포트포워딩(8081:80) 자동 시작 완료' : '⚠ 로컬 포트포워딩 자동 시작 실패'}
+                {results.portForwardApplied.ok
+                  ? (results.portForwardApplied.watching ? '⚡ 로컬 포트포워딩 자동 연결 대기 시작 (CI 완료 후 자동 연결)' : '⚡ 로컬 포트포워딩(8081:80) 자동 시작 완료')
+                  : '⚠ 로컬 포트포워딩 자동 시작 실패'}
               </div>
               <div style={{ fontSize: 11, color: 'var(--t2)', marginTop: 6, lineHeight: 1.6 }}>
                 {results.portForwardApplied.ok ? (
                   <>
-                    백그라운드에서 `kubectl port-forward` 프로세스가 자동으로 실행되었습니다.
+                    {results.portForwardApplied.watching
+                      ? <>GitHub Actions 빌드가 끝나고 Pod 가 Ready 되면 백그라운드에서 <b>자동으로</b> 포트포워딩이 시작됩니다(보통 1~3분 소요). Pod 가 새로 교체돼도 자동 재연결됩니다.</>
+                      : <>백그라운드에서 `kubectl port-forward` 프로세스가 자동으로 실행되었습니다.</>}
                     <br />
-                    아래 주소를 클릭하면 미니보드 웹에 즉시 접속할 수 있습니다:
+                    준비되면 아래 주소에서 미니보드 웹에 접속할 수 있습니다:
                     <br />
                     👉 <a href="http://localhost:8081" target="_blank" rel="noreferrer" style={{ color: 'var(--blue)', fontWeight: 'bold', textDecoration: 'underline' }}>http://localhost:8081</a>
                   </>

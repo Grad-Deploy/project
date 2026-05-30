@@ -1356,7 +1356,18 @@ function genDeployment(svc, ns, cloud = 'kind', imageCfg = {}) {
   const kind = isDB ? 'StatefulSet' : 'Deployment'
   const port = svc.port || t.port || 8080
   const isNginxType = (svc.type === 'nginx' || svc.type === 'react-nginx')
+  // 앱 서비스(비-DB)는 Mini Board 포함 모두 CI 가 빌드·푸시하는 공용 이미지를 참조한다.
+  //   ⚠️ svc.image 는 ImagePicker 가 고른 "베이스 이미지"(Dockerfile 의 FROM)일 뿐,
+  //      그대로 배포할 런타임 이미지가 아니다. node:20-alpine·nginx:alpine 을 그대로
+  //      deployment 에 박으면 애플리케이션 코드가 없어 CrashLoopBackOff(백엔드) 나
+  //      기본 nginx 환영 페이지(프론트)가 뜬다. 따라서 비-DB 는 항상 빌드 이미지를 가리킨다.
+  //   DB 는 공식 이미지를 그대로 쓰므로 svc.image(또는 기본 이미지)를 사용한다.
   const img = isDB ? (svc.image || getImageForService(svc)) : `${imageRepoForService(svc.name, imageCfg)}:latest`
+  // 비-DB(앱)는 CI 가 같은 태그(:latest 또는 :<sha>)로 이미지를 갱신하므로,
+  // IfNotPresent 면 kind 노드가 예전 빌드를 캐시한 채 새 이미지를 내려받지 않아
+  // 옛 화면(예: 기본 nginx 페이지)이 계속 뜬다. Always 로 항상 최신본을 Pull 한다.
+  // DB 는 불변 공식 이미지이므로 불필요한 Pull 을 피해 IfNotPresent 유지.
+  const pullPolicy = isDB ? 'IfNotPresent' : 'Always'
   const cpuR = svc.cpuReq || t.cpuReq || '100m'
   const memR = svc.memReq || t.memReq || '256Mi'
   const memL = svc.memLim || t.memLim || '512Mi'
@@ -1471,7 +1482,7 @@ spec:
       containers:
         - name: ${svc.name}
           image: "${img}"
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: ${pullPolicy}
           ports:
             - containerPort: ${port}
           resources:
@@ -1656,6 +1667,10 @@ export function genNginxConf(svc, services, ns) {
             root /usr/share/nginx/html;
             index index.html;
             try_files $uri $uri/ /index.html;  # SPA React Router fallback
+            # HTML 은 매 요청 재검증: 재배포 후 브라우저가 옛 페이지(기본 nginx 등)를
+            # 캐시째 보여주는 문제를 막는다. (nginx 기본값엔 Cache-Control 이 없어
+            # 휴리스틱 캐싱으로 stale 페이지가 오래 남는다)
+            add_header Cache-Control "no-store, no-cache, must-revalidate" always;
         }` : `
         location / {
             return 404;
@@ -1967,7 +1982,9 @@ export function genGitHubActions(services, cfg = {}) {
         `          password: \${{ secrets.DOCKERHUB_TOKEN }}`,
       ].join('\n')
 
-  // 앱 서비스만 빌드 (DB는 공식 이미지 사용)
+  // 앱 서비스(비-DB)는 모두 빌드한다. (DB 는 공식 이미지를 그대로 쓰므로 제외)
+  //   svc.image 는 Dockerfile 의 베이스(FROM)일 뿐이라 빌드 대상에서 제외하면 안 된다.
+  //   (제외하면 ghcr 이미지 빌드 잡이 사라져 Package 가 비고 Pod 가 베이스 이미지로 뜬다)
   const appServices = services.filter(s => !(SERVICE_TEMPLATES[s.type] || {}).isDB)
 
   const buildJobs = appServices.map(svc => {
@@ -2006,14 +2023,30 @@ ${loginBlock}
           cache-to: type=gha,mode=max,scope=${svc.name}${buildArgBlock}`
   }).join('\n\n')
 
+  const buildJobsBlock = buildJobs ? `${buildJobs}\n\n` : ''
   const needBuilds = appServices.map(s => `build-${s.name}`).join(', ')
+  const needBlock = needBuilds ? `\n    needs: [${needBuilds}]` : ''
 
   // 앱 서비스별 deployment.yaml 의 이미지 태그를 이번 커밋 SHA 로 고정하는 sed 라인.
-  // 레지스트리/소유자 대소문자에 무관하도록 이미지 이름 접미사로 매칭한다.
-  // (DB 서비스는 appServices 에 없으므로 postgres:16-alpine 등 공식 이미지는 건드리지 않음)
   const imageTagSeds = appServices.map(svc =>
     `          sed -i -E 's#(image: "[^"]*${imageNameOf(svc.name)}):[^"]*"#\\1:\${{ github.sha }}"#' ${servicesDir}/${svc.name}/deployment.yaml`
   ).join('\n')
+
+  const pinImageTagsStep = imageTagSeds.trim() !== ''
+    ? `\n      - name: Pin image tags in service manifests
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 1. 수정 전에 먼저 최신 원격 변경사항을 pull (충돌 방지)
+          git pull --rebase origin main
+          # 2. ArgoCD 가 실제로 sync 하는 services/<svc>/deployment.yaml 의
+          #    이미지 태그를 이번 커밋 SHA 로 고정한다.
+${imageTagSeds}
+          # 3. 변경 커밋 및 푸시
+          git add ${servicesDir}
+          git diff --staged --quiet || git commit -m "ci: pin image tags [\${{ github.sha }}]"
+          git push origin main`
+    : ''
 
   return `name: Grad-Deploy CI/CD
 
@@ -2031,10 +2064,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-${buildJobs}
-
-  update-manifests:
-    needs: [${needBuilds}]
+${buildJobsBlock}  update-manifests:${needBlock}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -2057,22 +2087,7 @@ ${buildJobs}
             exit 1
           fi
           echo "✅ 평문 Secret 없음"
-
-      - name: Pin image tags in service manifests
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 1. 수정 전에 먼저 최신 원격 변경사항을 pull (충돌 방지)
-          git pull --rebase origin main
-          # 2. ArgoCD 가 실제로 sync 하는 services/<svc>/deployment.yaml 의
-          #    이미지 태그를 이번 커밋 SHA 로 고정한다.
-          #    (overlays/production/kustomization.yaml 은 ApplicationSet 이 보지 않으므로
-          #     그곳만 갱신하면 새 이미지가 배포되지 않던 버그를 수정)
-${imageTagSeds}
-          # 3. 변경 커밋 및 푸시
-          git add ${servicesDir}
-          git diff --staged --quiet || git commit -m "ci: pin image tags [\${{ github.sha }}]"
-          git push origin main
+${pinImageTagsStep}
 
       # [제거됨] Register Repo to ArgoCD 스텝
       # ─────────────────────────────────────────────────────
@@ -3397,6 +3412,9 @@ echo "   rm k8s/projects/\${PROJ}/docs/bootstrap.sh"
       files[[base, 'cloudflared-tunnel.yaml'].join('/')] = genCloudflaredDeployment(svc, ns)
     }
 
+    // 모든 서비스에 Dockerfile 생성. svc.image(ImagePicker 선택값)는 FROM 베이스로 쓰인다.
+    // (Mini Board 의 node-svc/react-nginx-svc 는 함수 말미의 Mini Board 블록에서
+    //  실제 앱 소스를 담은 전용 Dockerfile 로 덮어쓴다.)
     files[`Dockerfile.${svc.name}`] = getDockerfileContent(svc, cloud)
   })
 
@@ -3442,8 +3460,12 @@ echo "   rm k8s/projects/\${PROJ}/docs/bootstrap.sh"
   // §2.2 + §4 Admin 운영 절차 + 체크리스트 통합 문서
   files[[projRoot, 'docs', 'admin-ops-guide.md'].join('/')]       = genAdminOpsGuide(proj, ns)
 
-  // ── Mini Board 테스트 서비스 감지 및 파일 포함 ──────────
-  // node-backend 타입에 POSTGRES_HOST env가 있으면 Mini Board 백엔드로 판단
+  // ── Mini Board 테스트 서비스 감지 및 빌드 소스 포함 ──────────
+  // node-backend 타입에 POSTGRES_HOST env가 있으면 Mini Board 백엔드로 판단.
+  // Mini Board 서비스도 일반 서비스와 동일하게 CI 가 빌드·푸시하는 공용 이미지
+  // (ghcr.io/<owner>/<svc>-service-v2)를 사용한다. 다만 실제 게시판 앱이 동작하도록
+  // 빌드 컨텍스트(sample-apps/)에 소스와 전용 Dockerfile 을 함께 제공해 빈 베이스
+  // 이미지가 아니라 애플리케이션이 담긴 이미지를 빌드하게 한다.
   const miniBackend  = services.find(s => s.type === 'node-backend' && s.env?.POSTGRES_HOST)
   const miniFrontend = miniBackend
     ? services.find(s => s.type === 'react-nginx' && (s.deps || []).includes(miniBackend.name))
@@ -3453,25 +3475,23 @@ echo "   rm k8s/projects/\${PROJ}/docs/bootstrap.sh"
     files[`Dockerfile.${miniBackend.name}`]   = minisBoardBackendDockerfile(proj, miniBackend.name, miniBackend.port || 3000)
 
     // ⚠️ [sync 버그 수정] 소스 파일(index.js/package.json/package-lock.json)을
-    //   ArgoCD 감시 경로인 services/<svc>/ 에는 더 이상 두지 않는다.
-    //   Dockerfile 의 build-context 가 sample-apps/backend/ 이므로 빌드에는 불필요하고,
-    //   GitOps 매니페스트 폴더에 비-K8s 파일이 섞이면 혼란을 준다.
-    //   (Docker build-context 전용으로 sample-apps/ 에만 둔다)
-    files[['sample-apps', 'backend', 'index.js'].join('/')]     = backendIndexSrc
-    files[['sample-apps', 'backend', 'package.json'].join('/')] = backendPkgSrc
-    files[['sample-apps', 'backend', 'package-lock.json'].join('/')] = backendLockSrc
+    //   ArgoCD 감시 경로인 services/<svc>/ 에는 두지 않는다.
+    //   Dockerfile 의 build-context 가 projRoot/apps/backend/ 이므로 빌드 전용으로 둔다.
+    files[[projRoot, 'apps', 'backend', 'index.js'].join('/')]     = backendIndexSrc
+    files[[projRoot, 'apps', 'backend', 'package.json'].join('/')] = backendPkgSrc
+    files[[projRoot, 'apps', 'backend', 'package-lock.json'].join('/')] = backendLockSrc
   }
 
   if (miniFrontend) {
     files[`Dockerfile.${miniFrontend.name}`]  = getMinisBoardFrontendDockerfile(proj, miniFrontend.name)
 
-    // ⚠️ [sync 버그 수정] 위와 동일 — 정적 소스는 build-context(sample-apps/)에만 둔다.
+    // ⚠️ 정적 소스는 build-context(projRoot/apps/)에만 둔다.
     //   services/<svc>/ 에는 nginx-conf.yaml(ConfigMap) 등 K8s 매니페스트만 남긴다.
-    files[['sample-apps', 'frontend', 'index.html'].join('/')]  = frontendHtmlSrc
-    files[['sample-apps', 'frontend', 'nginx.conf'].join('/')]  = getFrontendNginxSrc(miniBackend ? miniBackend.name : 'node-svc')
+    files[[projRoot, 'apps', 'frontend', 'index.html'].join('/')]  = frontendHtmlSrc
+    files[[projRoot, 'apps', 'frontend', 'nginx.conf'].join('/')]  = getFrontendNginxSrc(miniBackend ? miniBackend.name : 'node-svc')
   }
 
-  // ── [신규] 미니 보드 배포 시 접속 URL을 수록한 README.md 자동 생성 ──
+  // ── 미니 보드 배포 시 접속 URL을 수록한 README.md 자동 생성 ──
   if (miniBackend && miniFrontend) {
     const readmeContent = genMiniBoardReadme(proj, ns, miniBackend.name, miniFrontend.name)
     files['README.md'] = readmeContent
@@ -3736,7 +3756,7 @@ else
 fi
 
 print_header "7. GHCR imagePullSecret 확인"
-SECRET_NAME="ghcr-pull-secret"
+SECRET_NAME="ghcr-secret"
 if kubectl get secret \${SECRET_NAME} -n \${NS} &>/dev/null; then
   check_pass "imagePullSecret '\${SECRET_NAME}' 존재 (ns: \${NS})"
 else
@@ -4340,7 +4360,7 @@ bash scripts/check-applicationset.sh
 function minisBoardBackendDockerfile(proj = 'my-app', backendName = 'node-svc', port = 3000) {
   return `FROM node:20-alpine
 WORKDIR /app
-COPY sample-apps/backend/ .
+COPY k8s/projects/${proj}/apps/backend/ .
 RUN npm ci --production
 EXPOSE ${port}
 USER node
@@ -4350,8 +4370,8 @@ CMD ["node", "index.js"]`
 // ── minisBoardFrontendDockerfile ─────────────────────────────
 function getMinisBoardFrontendDockerfile(proj = 'my-app', frontendName = 'react-nginx-svc') {
   return `FROM nginx:alpine
-COPY sample-apps/frontend/nginx.conf /etc/nginx/conf.d/default.conf
-COPY sample-apps/frontend/index.html /usr/share/nginx/html/index.html
+COPY k8s/projects/${proj}/apps/frontend/nginx.conf /etc/nginx/conf.d/default.conf
+COPY k8s/projects/${proj}/apps/frontend/index.html /usr/share/nginx/html/index.html
 EXPOSE 80`
 }
 

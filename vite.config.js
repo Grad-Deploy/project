@@ -496,7 +496,7 @@ export default defineConfig(({ mode }) => {
   const backendUrl = env.VITE_BACKEND_URL || 'http://localhost:4000'
 
   return {
-    plugins: [react(), terminalPlugin(), argocdProxyPlugin(), bootstrapPlugin(), applySecretsPlugin(), portForwardPlugin()],
+    plugins: [react(), terminalPlugin()],
     server: {
       host: '0.0.0.0',
       port: 5173,
@@ -509,6 +509,36 @@ export default defineConfig(({ mode }) => {
           secure: false,
         },
         '/status': {
+          target: backendUrl,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/argocd-api': {
+          target: backendUrl,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/api/bootstrap': {
+          target: backendUrl,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/api/apply-secrets': {
+          target: backendUrl,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/api/port-forward': {
+          target: backendUrl,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/api/tunnel-url': {
+          target: backendUrl,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/api/demo': {
           target: backendUrl,
           changeOrigin: true,
           secure: false,
