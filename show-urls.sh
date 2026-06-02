@@ -32,13 +32,11 @@ extract_url() {
 ARGOCD_URL=$(extract_url cf-argocd)
 BACKEND_URL=$(extract_url cf-backend)
 FRONTEND_URL=$(extract_url cf-frontend)
-MINIBOARD_URL=$(extract_url cf-miniboard)
 
 echo ""
 echo -e "  ${YELLOW}ArgoCD UI:${NC}   ${ARGOCD_URL:-(없음 - tmux cf-argocd 창 확인)}"
 echo -e "  ${YELLOW}Backend:${NC}     ${BACKEND_URL:-(없음 - tmux cf-backend 창 확인)}"
 echo -e "  ${YELLOW}Frontend:${NC}    ${FRONTEND_URL:-(없음 - tmux cf-frontend 창 확인)}"
-echo -e "  ${YELLOW}Mini Board:${NC}   ${MINIBOARD_URL:-(배포 대기 중... 배포 완료 시 자동 활성화되며 tmux cf-miniboard 창 확인)}"
 echo ""
 
 ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret \
